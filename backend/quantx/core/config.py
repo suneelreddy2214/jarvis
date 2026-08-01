@@ -58,8 +58,9 @@ class MarketsConfig(BaseModel):
 
 class PositionSizingConfig(BaseModel):
     method: str = "atr"
-    atr_multiplier: float = 2.0
+    atr_multiplier: float = 2.5  # wider ATR stops — noise floor (TECHM post-mortem)
     default_atr_period: int = 14
+    min_stop_atr_mult: float = 2.0  # refuse stops tighter than this × ATR
 
 
 class MarketDataConfig(BaseModel):
@@ -75,13 +76,20 @@ class EntryConfig(BaseModel):
     require_momentum: bool = True
     require_volume: bool = True
     require_adx: bool = True
-    min_adx: float = 20.0
-    min_volume_ratio: float = 1.0
+    min_adx: float = 25.0  # trend strength confirmed (was 20 — too weak)
+    min_volume_ratio: float = 1.3
+    min_breakout_volume_ratio: float = 1.5
     min_confidence: int = 60
     min_fundamental_score: int = 50
     avoid_major_news: bool = True
     min_confluence_factors: int = 4
     require_fundamental_metrics: bool = True
+    require_rsi_alignment: bool = True
+    min_rsi_long: float = 52.0
+    max_rsi_short: float = 48.0
+    require_ema_stack: bool = True  # long needs EMA9>21>50; short reverse
+    block_breakout_on_vix_complacency: bool = True
+    block_on_vix_elevated: bool = True  # VIX >= 18 — no fresh swing/breakout
 
 
 class ExitConfig(BaseModel):
@@ -90,6 +98,8 @@ class ExitConfig(BaseModel):
     trailing_atr_mult: float = 2.0
     trail_after_r: float = 1.0  # only trail after this many R of favorable move
     time_exit_bars: int = 20
+    exit_on_opposite_ema_stack: bool = True
+    force_flat_on_hard_loss_limit: bool = True  # flatten opens when daily 2% / weekly 5% hit
 
 
 class AgentConfig(BaseModel):

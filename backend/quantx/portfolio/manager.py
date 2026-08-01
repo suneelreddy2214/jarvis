@@ -220,6 +220,11 @@ class PortfolioManager:
     def mark_to_market(self) -> list[Position]:
         opens = self.db.list_positions("OPEN")
         updated = []
+        exit_cfg = self.settings.exit
+        force_flat = bool(getattr(exit_cfg, "force_flat_on_hard_loss_limit", True))
+        ema_exit = bool(getattr(exit_cfg, "exit_on_opposite_ema_stack", True))
+
+        # Phase 1 — mark prices / unrealized
         for p in opens:
             mult = lot_multiplier(p.trade_type, p.symbol)
             try:
@@ -234,7 +239,6 @@ class PortfolioManager:
                             meta["kind"],
                         )
                     else:
-                        # Fallback: scale premium with underlying move
                         price = max(0.05, p.entry_price * (1 + float(q.get("change_pct", 0)) / 200))
                 else:
                     q = self.data.get_quote(p.symbol, p.exchange)
@@ -249,13 +253,22 @@ class PortfolioManager:
             notional = p.entry_price * p.quantity * mult
             p.pnl_pct = (p.pnl / notional * 100) if notional else 0
 
-            # Trailing stop: only after favorable move of trail_after_r (default 1R).
-            # Prior bug: immediately tightened stop to ~0.5R and caused noise stop-outs.
+        self._hydrate_risk_from_db()
+        unrealized = sum(float(p.pnl or 0.0) for p in opens)
+        self.risk.update_state(unrealized_pnl=unrealized, open_positions=len(opens))
+        hard_loss_hit = (
+            self.risk.daily_loss_pct >= self.settings.risk.max_daily_loss_pct
+            or self.risk.weekly_loss_pct >= self.settings.risk.max_weekly_loss_pct
+            or self.risk.drawdown_pct >= self.settings.risk.max_drawdown_pct
+        )
+
+        # Phase 2 — exits (stops, targets, EMA stack, hard loss flatten)
+        for p in opens:
+            price = float(p.current_price)
             initial_risk = abs(p.entry_price - p.stop_loss)
             if self.settings.exit.use_trailing_stop:
                 trail_after = float(getattr(self.settings.exit, "trail_after_r", 1.0) or 1.0)
                 trail_mult = float(getattr(self.settings.exit, "trailing_atr_mult", 2.0) or 2.0)
-                # Keep trail distance near initial risk (wider = less noise)
                 trail_dist = initial_risk * max(0.75, trail_mult / 2.0)
                 if p.side == Side.BUY:
                     favor_r = ((price - p.entry_price) / initial_risk) if initial_risk > 0 else 0.0
@@ -274,8 +287,6 @@ class PortfolioManager:
             else:
                 effective_stop = p.stop_loss
 
-            # Data-integrity: Yahoo vs stale/synthetic entry can gap 50%+ in one tick.
-            # Never realize a mark worse than the protective stop on such anomalies.
             anomalous_gap = False
             if p.entry_price > 0 and initial_risk > 0:
                 move_pct = abs(price - p.entry_price) / p.entry_price
@@ -289,13 +300,18 @@ class PortfolioManager:
 
             exit_reason = None
             fill_price = price
-            if anomalous_gap:
+            if force_flat and hard_loss_hit:
+                exit_reason = (
+                    f"Hard loss limit — flatten open risk "
+                    f"(daily {self.risk.daily_loss_pct:.2f}% / weekly {self.risk.weekly_loss_pct:.2f}%)"
+                )
+                fill_price = float(price)
+            elif anomalous_gap:
                 exit_reason = "Anomalous quote gap — protective stop fill (data integrity)"
                 fill_price = float(effective_stop)
             elif p.side == Side.BUY:
                 if price <= effective_stop:
                     exit_reason = "Stop loss / trailing stop hit"
-                    # Hard stop fill: paper stop order fills at stop, not far below it
                     fill_price = float(effective_stop)
                 elif price >= p.target_2:
                     exit_reason = "Target 2 hit"
@@ -313,6 +329,27 @@ class PortfolioManager:
                 elif price <= p.target_1:
                     exit_reason = "Target 1 hit"
                     fill_price = float(p.target_1)
+
+            if exit_reason is None and ema_exit and p.trade_type in (
+                TradeType.SWING,
+                TradeType.INTRADAY,
+                TradeType.FUTURES,
+            ):
+                try:
+                    from quantx.analysis.technical import TechnicalAnalyzer
+
+                    df = self.data.get_ohlc(p.symbol, p.exchange, period="3mo")
+                    snap = TechnicalAnalyzer().analyze(df)
+                    bull = snap.ema_9 > snap.ema_21 > snap.ema_50
+                    bear = snap.ema_9 < snap.ema_21 < snap.ema_50
+                    if p.side == Side.BUY and bear:
+                        exit_reason = "Opposite EMA stack (9<21<50) — structure invalidation"
+                        fill_price = float(price)
+                    elif p.side == Side.SELL and bull:
+                        exit_reason = "Opposite EMA stack (9>21>50) — structure invalidation"
+                        fill_price = float(price)
+                except Exception:
+                    pass
 
             if exit_reason:
                 self.close_position(p.id, fill_price, exit_reason)  # type: ignore[arg-type]

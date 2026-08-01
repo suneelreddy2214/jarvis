@@ -46,6 +46,40 @@ _ADX_EXEMPT_STRATEGIES = {
     "quant_zscore",
     "options_income_bias",
     "basis_arbitrage",
+    "rsi_oversold",
+}
+
+_VOLUME_EXEMPT_STRATEGIES = {
+    "intraday_mean_reversion",
+    "bollinger_reversion",
+    "value_mean_reversion",
+    "quant_zscore",
+    "rsi_oversold",
+    "basis_arbitrage",
+}
+
+_BREAKOUT_STRATEGIES = {
+    "breakout",
+    "volume_breakout",
+    "donchian_breakout",
+    "futures_breakout",
+    "opening_range_proxy",
+}
+
+_TREND_STRATEGIES = {
+    "swing_trend",
+    "ema_cross_9_21",
+    "ema_cross_20_50",
+    "ema_cross_50_200",
+    "supertrend",
+    "adx_trend_strength",
+    "futures_trend",
+    "futures_momentum",
+    "growth_momentum",
+    "macd_momentum",
+    "rsi_momentum",
+    "long_term_trend",
+    "position_hold",
 }
 
 
@@ -191,16 +225,75 @@ class QuantXEngine:
         elif strat.name == "intraday_mean_reversion":
             pass  # mean-reversion intentionally trades ranges / neutral momentum
 
-        # ADX strength confirmation (post-mortem: many losers lacked trend strength)
-        min_adx = float(getattr(entry_cfg, "min_adx", 20.0) or 20.0)
+        # ADX strength confirmation (TECHM post-mortem: losers lacked trend strength)
+        min_adx = float(getattr(entry_cfg, "min_adx", 25.0) or 25.0)
         require_adx = bool(getattr(entry_cfg, "require_adx", True))
         strat_name = strat.name if strat else ""
         if require_adx and strat_name not in _ADX_EXEMPT_STRATEGIES and snap.adx < min_adx:
             rejects.append(f"ADX {snap.adx:.1f} < {min_adx:.0f} — trend strength not confirmed")
 
-        min_vol = float(getattr(entry_cfg, "min_volume_ratio", 1.0) or 1.0)
-        if entry_cfg.require_volume and snap.volume_ratio < min_vol and not index_sym:
+        min_vol = float(getattr(entry_cfg, "min_volume_ratio", 1.3) or 1.3)
+        breakout_vol = float(getattr(entry_cfg, "min_breakout_volume_ratio", 1.5) or 1.5)
+        if (
+            entry_cfg.require_volume
+            and strat_name not in _VOLUME_EXEMPT_STRATEGIES
+            and snap.volume_ratio < min_vol
+            and not index_sym
+        ):
             rejects.append(f"Volume not confirmed (ratio {snap.volume_ratio:.2f} < {min_vol:.2f})")
+        # Breakout family needs stronger volume confirmation
+        if strat_name in _BREAKOUT_STRATEGIES and snap.volume_ratio < breakout_vol and not index_sym:
+            rejects.append(
+                f"Breakout volume weak (ratio {snap.volume_ratio:.2f} < {breakout_vol:.2f})"
+            )
+
+        # RSI alignment for trend / breakout (not mean-reversion)
+        if (
+            bool(getattr(entry_cfg, "require_rsi_alignment", True))
+            and strat_name not in _ADX_EXEMPT_STRATEGIES
+            and trade_type in (TradeType.SWING, TradeType.INTRADAY, TradeType.FUTURES)
+        ):
+            min_rsi = float(getattr(entry_cfg, "min_rsi_long", 52.0) or 52.0)
+            max_rsi = float(getattr(entry_cfg, "max_rsi_short", 48.0) or 48.0)
+            if side == Side.BUY and snap.rsi < min_rsi:
+                rejects.append(f"RSI {snap.rsi:.1f} < {min_rsi:.0f} — long momentum not confirmed")
+            if side == Side.SELL and snap.rsi > max_rsi:
+                rejects.append(f"RSI {snap.rsi:.1f} > {max_rsi:.0f} — short momentum not confirmed")
+
+        # EMA stack alignment (avoid entering against structure)
+        if (
+            bool(getattr(entry_cfg, "require_ema_stack", True))
+            and strat_name in (_TREND_STRATEGIES | _BREAKOUT_STRATEGIES | {""})
+            and trade_type in (TradeType.SWING, TradeType.FUTURES)
+        ):
+            bull_stack = snap.ema_9 > snap.ema_21 > snap.ema_50
+            bear_stack = snap.ema_9 < snap.ema_21 < snap.ema_50
+            if side == Side.BUY and not bull_stack:
+                rejects.append("EMA stack not bullish (need 9>21>50) — avoid counter-structure long")
+            if side == Side.SELL and not bear_stack:
+                rejects.append("EMA stack not bearish (need 9<21<50) — avoid counter-structure short")
+
+        # India VIX / USDINR — harden vs TECHM-style entries into bad vol regimes
+        vix_regime = getattr(macro, "vix_regime", "unknown")
+        caution = set(getattr(macro, "caution_flags", []) or [])
+        if (
+            bool(getattr(entry_cfg, "block_on_vix_elevated", True))
+            and vix_regime == "elevated"
+            and trade_type in (TradeType.SWING, TradeType.INTRADAY)
+            and strat_name not in _ADX_EXEMPT_STRATEGIES
+        ):
+            rejects.append(f"India VIX elevated ({macro.vix_level}) — no fresh equity risk")
+        if (
+            bool(getattr(entry_cfg, "block_breakout_on_vix_complacency", True))
+            and "vix_complacency" in caution
+            and strat_name in _BREAKOUT_STRATEGIES
+        ):
+            rejects.append("VIX complacency — block breakout entries (false break risk)")
+        if "inr_weak" in caution and side == Side.BUY and trade_type == TradeType.SWING and not index_sym:
+            # Extra bar for equity longs when USDINR pressure (IT/exporters sensitive)
+            if snap.adx < min_adx + 5:
+                rejects.append("USDINR weak + ADX not strong enough for equity long")
+
         # Fundamentals: skip / relax for index F&O and short-horizon intraday
         if not index_sym and fund.score < entry_cfg.min_fundamental_score:
             if trade_type == TradeType.INTRADAY:
@@ -296,20 +389,28 @@ class QuantXEngine:
                 levels["target_2"] = round(levels["entry"] - 3 * stop_dist, 2)
             levels["risk_reward"] = 2.0
             mult = lot_multiplier(TradeType.FUTURES, symbol_clean)
-            # Ensure ≥1 lot can fit inside 1% risk (index ATR stops are often too wide)
+            # Ensure ≥1 lot can fit inside 1% risk — but NEVER compress stop below ATR floor
             risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0) * max(risk_scale, 0.01)
             max_stop = risk_budget / mult if mult else levels["entry"]
             stop_dist = abs(levels["entry"] - levels["stop_loss"])
+            min_stop_atr = float(getattr(self.settings.position_sizing, "min_stop_atr_mult", 2.0) or 2.0)
+            atr_floor = max(snap.atr, levels["entry"] * 0.005) * min_stop_atr
             if stop_dist > max_stop > 0:
-                if side == Side.BUY:
-                    levels["stop_loss"] = round(levels["entry"] - max_stop, 2)
-                    levels["target_1"] = round(levels["entry"] + 2 * max_stop, 2)
-                    levels["target_2"] = round(levels["entry"] + 3 * max_stop, 2)
+                if max_stop < atr_floor:
+                    rejects.append(
+                        f"Futures ATR stop ₹{stop_dist:.2f} exceeds 1% risk budget "
+                        f"(max ₹{max_stop:.2f}) — refuse compressed stop (TECHM ATR floor)"
+                    )
                 else:
-                    levels["stop_loss"] = round(levels["entry"] + max_stop, 2)
-                    levels["target_1"] = round(levels["entry"] - 2 * max_stop, 2)
-                    levels["target_2"] = round(levels["entry"] - 3 * max_stop, 2)
-                levels["risk_reward"] = 2.0
+                    if side == Side.BUY:
+                        levels["stop_loss"] = round(levels["entry"] - max_stop, 2)
+                        levels["target_1"] = round(levels["entry"] + 2 * max_stop, 2)
+                        levels["target_2"] = round(levels["entry"] + 3 * max_stop, 2)
+                    else:
+                        levels["stop_loss"] = round(levels["entry"] + max_stop, 2)
+                        levels["target_1"] = round(levels["entry"] - 2 * max_stop, 2)
+                        levels["target_2"] = round(levels["entry"] - 3 * max_stop, 2)
+                    levels["risk_reward"] = 2.0
             size = self.sizer.calculate(
                 capital=capital,
                 entry=levels["entry"],
@@ -381,6 +482,14 @@ class QuantXEngine:
 
         else:
             levels = self.ta.levels_for_trade(snap, side, atr_stop_mult=atr_mult)
+            # Hard ATR floor check — reject noise-tight stops
+            stop_dist = abs(levels["entry"] - levels["stop_loss"])
+            min_stop_atr = float(getattr(self.settings.position_sizing, "min_stop_atr_mult", 2.0) or 2.0)
+            atr_floor = max(snap.atr, levels["entry"] * 0.005) * min_stop_atr
+            if stop_dist + 1e-9 < atr_floor:
+                rejects.append(
+                    f"Stop ₹{stop_dist:.2f} < {min_stop_atr:.1f}×ATR ₹{atr_floor:.2f} — noise stop risk"
+                )
             size = self.sizer.calculate(
                 capital=capital,
                 entry=levels["entry"],

@@ -68,12 +68,20 @@ class PositionSizer:
         if scale < 0.999:
             notes = f"Size scaled {scale:.0%} for macro/vol"
         if method == "atr" and atr and atr > 0 and not quantity_as_lots:
-            min_stop = atr * self.settings.position_sizing.atr_multiplier
-            if stop_distance < min_stop * 0.5:
-                notes = (notes + "; " if notes else "") + (
-                    f"Stop unusually tight vs ATR({atr:.2f}); size reduced for safety"
+            min_mult = float(getattr(self.settings.position_sizing, "min_stop_atr_mult", 2.0) or 2.0)
+            min_stop = atr * min_mult
+            if stop_distance < min_stop * 0.95:
+                return PositionSizeResult(
+                    quantity=0,
+                    capital_at_risk=0.0,
+                    stop_distance=stop_distance,
+                    risk_pct=0.0,
+                    method=method,
+                    notes=(
+                        f"Stop ₹{stop_distance:.2f} too tight vs {min_mult:.1f}×ATR "
+                        f"(₹{min_stop:.2f}) — trade rejected"
+                    ),
                 )
-                stop_distance = max(stop_distance, min_stop * 0.5)
 
         mult = max(1, int(lot_size))
 

@@ -313,17 +313,43 @@ class TechnicalAnalyzer:
     def levels_for_trade(
         self, snap: IndicatorSnapshot, side: Side, atr_stop_mult: float = 2.0
     ) -> dict[str, float]:
+        """
+        ATR-anchored stops. Structural S1/R1 may WIDEN the stop, never tighten
+        below atr_stop_mult × ATR (TECHM: SL too tight vs ATR → noise stop-out).
+        """
         atr = max(snap.atr, snap.close * 0.005)
         entry = snap.close
+        min_dist = atr_stop_mult * atr
         if side == Side.BUY:
-            stop = min(entry - atr_stop_mult * atr, snap.s1 if snap.s1 < entry else entry - atr_stop_mult * atr)
+            atr_stop = entry - min_dist
+            # Only use support if it is further away (wider stop)
+            if snap.s1 > 0 and snap.s1 < atr_stop:
+                stop = float(snap.s1)
+            else:
+                stop = atr_stop
             risk = entry - stop
+            if risk < min_dist * 0.99:
+                stop = atr_stop
+                risk = min_dist
             t1 = entry + 2 * risk
             t2 = entry + 3 * risk
         else:
-            stop = max(entry + atr_stop_mult * atr, snap.r1 if snap.r1 > entry else entry + atr_stop_mult * atr)
+            atr_stop = entry + min_dist
+            if snap.r1 > 0 and snap.r1 > atr_stop:
+                stop = float(snap.r1)
+            else:
+                stop = atr_stop
             risk = stop - entry
+            if risk < min_dist * 0.99:
+                stop = atr_stop
+                risk = min_dist
             t1 = entry - 2 * risk
             t2 = entry - 3 * risk
         rr = abs(t1 - entry) / risk if risk > 0 else 0
-        return {"entry": entry, "stop_loss": stop, "target_1": t1, "target_2": t2, "risk_reward": rr}
+        return {
+            "entry": round(entry, 2),
+            "stop_loss": round(stop, 2),
+            "target_1": round(t1, 2),
+            "target_2": round(t2, 2),
+            "risk_reward": round(rr, 2),
+        }
