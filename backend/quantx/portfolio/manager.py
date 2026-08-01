@@ -17,6 +17,7 @@ from quantx.core.models import (
 from quantx.core.risk import RiskManager
 from quantx.data.market_data import MarketDataService
 from quantx.portfolio.db import Database
+from quantx.portfolio.margin import MarginCalculator
 
 
 class PortfolioManager:
@@ -68,16 +69,32 @@ class PortfolioManager:
         self.db.set_state("max_drawdown_lock", s.max_drawdown_lock)
         self.db.set_state("manual_override", s.manual_override)
 
+    def margin_book(self) -> dict:
+        """Stocks / F&O / ETF margin breakdown for dashboard."""
+        self._hydrate_risk_from_db()
+        opens = self.db.list_positions("OPEN")
+        book = MarginCalculator().build_book(self.risk.state.capital, opens)
+        data = book.as_dict()
+        stocks = [p for p in data["positions"] if p["product"] in ("Stocks", "ETF")]
+        fno = [p for p in data["positions"] if p["segment"] == "FO"]
+        data["stocks"] = stocks
+        data["fno"] = fno
+        data["stocks_count"] = len(stocks)
+        data["fno_count"] = len(fno)
+        data["initial_capital"] = float(self.settings.capital.initial)
+        data["unrealized_pnl"] = round(sum(p.pnl for p in opens), 2)
+        return data
+
     def snapshot(self) -> PortfolioSnapshot:
         self._hydrate_risk_from_db()
         opens = self.db.list_positions("OPEN")
         unrealized = sum(p.pnl for p in opens)
         total_pnl = (self.risk.state.capital + unrealized) - self.settings.capital.initial
-        used_margin = sum(p.entry_price * p.quantity * 0.2 for p in opens)  # approx 20% margin
+        book = MarginCalculator().build_book(self.risk.state.capital, opens)
         return PortfolioSnapshot(
             capital=self.risk.state.capital,
-            available_margin=max(0, self.risk.state.capital - used_margin),
-            used_margin=used_margin,
+            available_margin=round(book.available_margin, 2),
+            used_margin=round(book.total_margin_used, 2),
             open_positions=len(opens),
             unrealized_pnl=round(unrealized, 2),
             realized_pnl_today=round(self.risk.state.daily_realized_pnl, 2),

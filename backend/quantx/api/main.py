@@ -54,6 +54,7 @@ def _chat_context() -> dict:
     return {
         "portfolio": snap.model_dump(),
         "risk": risk.model_dump(),
+        "margin": portfolio.margin_book(),
         "positions": opens + closed,
         "open_positions": opens,
         "orders": db.list_orders(100),
@@ -216,6 +217,12 @@ def session():
 @app.get("/api/portfolio")
 def get_portfolio():
     return portfolio.snapshot().model_dump()
+
+
+@app.get("/api/margin")
+def get_margin():
+    """Stocks, F&O, and margin amount details for the dashboard."""
+    return portfolio.margin_book()
 
 
 @app.get("/api/performance")

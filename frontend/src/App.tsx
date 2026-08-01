@@ -6,6 +6,7 @@ import {
   pct,
   type EmergencyState,
   type JournalEntry,
+  type MarginBook,
   type MarketSession,
   type PortfolioSnapshot,
   type Position,
@@ -67,7 +68,8 @@ export default function App() {
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
-  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl' | 'chat'>('overview')
+  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl' | 'chat' | 'margin'>('overview')
+  const [marginBook, setMarginBook] = useState<MarginBook | null>(null)
   const [orders, setOrders] = useState<
     Array<{
       id: number
@@ -124,7 +126,7 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc, pnl] = await Promise.all([
+      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc, pnl, margin] = await Promise.all([
         api.portfolio(),
         api.risk(),
         api.session(),
@@ -137,6 +139,7 @@ export default function App() {
         api.orders(),
         api.cycles(),
         api.pnl(),
+        api.margin(),
       ])
       setPortfolio(p)
       setRisk(r)
@@ -157,6 +160,7 @@ export default function App() {
       setOrders(ords)
       setCycles(cyc)
       setPnlData(pnl)
+      setMarginBook(margin)
       try {
         const cfg = await api.llmConfig()
         setLlmCfg(cfg)
@@ -493,27 +497,23 @@ export default function App() {
           <strong>{portfolio ? inr(portfolio.capital) : '—'}</strong>
         </div>
         <div className="metric">
+          <label>Available Margin</label>
+          <strong>{portfolio ? inr(portfolio.available_margin) : '—'}</strong>
+        </div>
+        <div className="metric">
+          <label>Used Margin</label>
+          <strong>{portfolio ? inr(portfolio.used_margin) : '—'}</strong>
+        </div>
+        <div className="metric">
           <label>Total PnL</label>
           <strong className={(portfolio?.total_pnl || 0) >= 0 ? 'pos' : 'neg'}>
             {portfolio ? inr(portfolio.total_pnl) : '—'}
           </strong>
         </div>
         <div className="metric">
-          <label>Unrealized</label>
-          <strong className={(portfolio?.unrealized_pnl || 0) >= 0 ? 'pos' : 'neg'}>
-            {portfolio ? inr(portfolio.unrealized_pnl) : '—'}
-          </strong>
-        </div>
-        <div className="metric">
           <label>Drawdown</label>
           <strong className={(portfolio?.drawdown_pct || 0) > 2 ? 'warn' : ''}>
             {portfolio ? `${portfolio.drawdown_pct.toFixed(2)}%` : '—'}
-          </strong>
-        </div>
-        <div className="metric">
-          <label>Open / Max</label>
-          <strong>
-            {portfolio?.open_positions ?? '—'} / {risk ? risk.open_positions >= 0 ? 5 : 5 : 5}
           </strong>
         </div>
         <div className="metric">
@@ -528,6 +528,10 @@ export default function App() {
         <button className={`tab${tab === 'overview' ? ' active' : ''}`} onClick={() => setTab('overview')} type="button">
           Overview
         </button>
+        <button className={`tab${tab === 'margin' ? ' active' : ''}`} onClick={() => setTab('margin')} type="button">
+          Stocks / F&amp;O
+          <span className="count">{(marginBook?.stocks_count || 0) + (marginBook?.fno_count || 0)}</span>
+        </button>
         <button className={`tab${tab === 'orders' ? ' active' : ''}`} onClick={() => setTab('orders')} type="button">
           Orders<span className="count">{orders.length}</span>
         </button>
@@ -541,6 +545,209 @@ export default function App() {
           Chat
         </button>
       </nav>
+
+      {tab === 'margin' && (
+        <div className="margin-page">
+          <section className="panel" style={{ marginBottom: '1rem' }}>
+            <div className="panel-head">
+              <h2>Margin Amount</h2>
+              <div className="actions">
+                <button className="btn" type="button" onClick={() => void refresh()}>
+                  Refresh
+                </button>
+              </div>
+            </div>
+            {!marginBook ? (
+              <p className="empty">Loading margin book…</p>
+            ) : (
+              <>
+                <div className="rec-grid" style={{ marginBottom: '1rem' }}>
+                  <div className="rec-cell">
+                    <span>Capital</span>
+                    <strong>{inr(marginBook.capital)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Used Margin</span>
+                    <strong>{inr(marginBook.total_margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Available Margin</span>
+                    <strong className="pos">{inr(marginBook.available_margin)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Utilization</span>
+                    <strong className={marginBook.margin_utilization_pct > 80 ? 'neg' : ''}>
+                      {marginBook.margin_utilization_pct.toFixed(1)}%
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Stocks Margin</span>
+                    <strong>{inr(marginBook.by_segment.stocks.margin_used + marginBook.by_segment.etf.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>F&amp;O Margin</span>
+                    <strong>{inr(marginBook.fo_total_margin)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>F&amp;O Exposure</span>
+                    <strong>{inr(marginBook.fo_total_exposure)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Unrealized</span>
+                    <strong className={marginBook.unrealized_pnl >= 0 ? 'pos' : 'neg'}>
+                      {inr(marginBook.unrealized_pnl)}
+                    </strong>
+                  </div>
+                </div>
+                <div className="util-track" aria-label="Margin utilization">
+                  <div
+                    className="util-fill"
+                    style={{ width: `${Math.max(0, Math.min(100, marginBook.margin_utilization_pct))}%` }}
+                  />
+                </div>
+                <p className="empty" style={{ marginTop: '0.75rem' }}>
+                  {marginBook.notes.join(' ')}
+                </p>
+              </>
+            )}
+          </section>
+
+          <div className="grid">
+            <section className="panel">
+              <div className="panel-head">
+                <h2>Stocks</h2>
+                <span className="pill valid">{marginBook?.stocks_count ?? 0} open</span>
+              </div>
+              {!marginBook || marginBook.stocks.length === 0 ? (
+                <p className="empty">
+                  No open stock / ETF positions. Paper scanner opens SWING equity (CNC 100% cash) or INTRADAY (MIS ~20%).
+                </p>
+              ) : (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Type</th>
+                      <th>Side</th>
+                      <th>Qty</th>
+                      <th>LTP</th>
+                      <th>Exposure</th>
+                      <th>Margin</th>
+                      <th>PnL</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {marginBook.stocks.map((p) => (
+                      <tr key={`eq-${p.position_id}-${p.symbol}`}>
+                        <td>{p.symbol}</td>
+                        <td>
+                          {p.product} · {p.trade_type}
+                        </td>
+                        <td>
+                          <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
+                        </td>
+                        <td>{p.quantity}</td>
+                        <td>{inrDec(p.ltp)}</td>
+                        <td>{inr(p.exposure)}</td>
+                        <td>
+                          {inr(p.margin_required)}
+                          <span className="muted"> ({p.margin_pct}%)</span>
+                        </td>
+                        <td className={p.unrealized_pnl >= 0 ? 'pos' : 'neg'}>{inr(p.unrealized_pnl)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {marginBook && (
+                <div className="rec-grid" style={{ marginTop: '1rem' }}>
+                  <div className="rec-cell">
+                    <span>Stocks margin used</span>
+                    <strong>{inr(marginBook.by_segment.stocks.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Stocks exposure</span>
+                    <strong>{inr(marginBook.by_segment.stocks.exposure)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>ETF margin</span>
+                    <strong>{inr(marginBook.by_segment.etf.margin_used)}</strong>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-head">
+                <h2>F&amp;O</h2>
+                <span className="pill buy">{marginBook?.fno_count ?? 0} open</span>
+              </div>
+              {!marginBook || marginBook.fno.length === 0 ? (
+                <p className="empty">
+                  No open Futures / Options positions. When F&amp;O trades are open they appear here with lot multiplier,
+                  notional, and SPAN-style paper margin.
+                </p>
+              ) : (
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Product</th>
+                      <th>Side</th>
+                      <th>Lots</th>
+                      <th>Mult</th>
+                      <th>Notional</th>
+                      <th>Margin</th>
+                      <th>PnL</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {marginBook.fno.map((p) => (
+                      <tr key={`fo-${p.position_id}-${p.symbol}-${p.product}`}>
+                        <td>{p.symbol}</td>
+                        <td>
+                          {p.product} · {p.trade_type}
+                        </td>
+                        <td>
+                          <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
+                        </td>
+                        <td>{p.quantity}</td>
+                        <td>{p.multiplier}</td>
+                        <td>{inr(p.notional)}</td>
+                        <td>
+                          {inr(p.margin_required)}
+                          <span className="muted"> ({p.margin_pct}%)</span>
+                        </td>
+                        <td className={p.unrealized_pnl >= 0 ? 'pos' : 'neg'}>{inr(p.unrealized_pnl)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {marginBook && (
+                <div className="rec-grid" style={{ marginTop: '1rem' }}>
+                  <div className="rec-cell">
+                    <span>Futures margin</span>
+                    <strong>{inr(marginBook.by_segment.futures.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Options margin</span>
+                    <strong>{inr(marginBook.by_segment.options.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>F&amp;O total margin</span>
+                    <strong>{inr(marginBook.fo_total_margin)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>F&amp;O exposure</span>
+                    <strong>{inr(marginBook.fo_total_exposure)}</strong>
+                  </div>
+                </div>
+              )}
+            </section>
+          </div>
+        </div>
+      )}
 
       {tab === 'chat' && (
         <section className="panel" style={{ marginBottom: '1rem' }}>

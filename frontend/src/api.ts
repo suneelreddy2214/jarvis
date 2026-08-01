@@ -55,6 +55,7 @@ export type Position = {
   id: number
   symbol: string
   side: string
+  trade_type?: string
   quantity: number
   entry_price: number
   current_price: number
@@ -71,6 +72,62 @@ export type Position = {
   closed_at?: string | null
   opened_at?: string
   capital_at_risk?: number
+}
+
+export type MarginBook = {
+  capital: number
+  initial_capital: number
+  total_margin_used: number
+  available_margin: number
+  margin_utilization_pct: number
+  fo_total_margin: number
+  fo_total_exposure: number
+  stocks_count: number
+  fno_count: number
+  unrealized_pnl: number
+  by_segment: {
+    stocks: { label: string; margin_used: number; exposure: number; open_positions: number }
+    futures: { label: string; margin_used: number; exposure: number; open_positions: number }
+    options: { label: string; margin_used: number; exposure: number; open_positions: number }
+    etf: { label: string; margin_used: number; exposure: number; open_positions: number }
+  }
+  stocks: Array<{
+    position_id: number | null
+    symbol: string
+    product: string
+    segment: string
+    trade_type: string
+    side: string
+    quantity: number
+    entry_price: number
+    ltp: number
+    multiplier: number
+    notional: number
+    margin_required: number
+    margin_pct: number
+    exposure: number
+    unrealized_pnl: number
+    capital_at_risk: number
+  }>
+  fno: Array<{
+    position_id: number | null
+    symbol: string
+    product: string
+    segment: string
+    trade_type: string
+    side: string
+    quantity: number
+    entry_price: number
+    ltp: number
+    multiplier: number
+    notional: number
+    margin_required: number
+    margin_pct: number
+    exposure: number
+    unrealized_pnl: number
+    capital_at_risk: number
+  }>
+  notes: string[]
 }
 
 export type RiskStatus = {
@@ -138,6 +195,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => req<{ agent: string; version: string; mode: string }>('/api/health'),
   portfolio: () => req<PortfolioSnapshot>('/api/portfolio'),
+  margin: () => req<MarginBook>('/api/margin'),
   risk: () => req<RiskStatus>('/api/risk'),
   session: () => req<MarketSession>('/api/session'),
   positions: () => req<Position[]>('/api/positions'),
