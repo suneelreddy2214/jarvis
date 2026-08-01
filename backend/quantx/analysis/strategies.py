@@ -173,6 +173,16 @@ class FuturesTrendStrategy(Strategy):
                 tags += ["fut_short", "adx_trend"]
                 boost += 4
 
+        # Reject weak-ADX futures entries (range risk) even if EMA aligned
+        if side is not None and snap.adx < 20:
+            return StrategySignal(
+                side=None,
+                trade_type=self.trade_type,
+                confidence_boost=0,
+                reason=f"FuturesTrend FLAT: ADX {snap.adx:.1f} < 20 — skip weak trend",
+                tags=["adx_weak"],
+            )
+
         if snap.volume_ratio >= 1.1:
             tags.append("volume")
             boost += 2
