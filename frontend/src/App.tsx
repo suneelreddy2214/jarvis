@@ -92,6 +92,22 @@ export default function App() {
   } | null>(null)
   const [strategyCount, setStrategyCount] = useState(0)
   const [learningTop, setLearningTop] = useState<Array<{ strategy: string; weight: number; win_rate: number; pnl: number }>>([])
+  const [tradingStyles, setTradingStyles] = useState<
+    Array<{
+      id: string
+      name: string
+      holding_period: string
+      risk: string
+      instruments: string[]
+      ai_suitability: number
+      ai_stars: string
+      strategy_count: number
+      strategies_available: string[]
+      notes: string
+    }>
+  >([])
+  const [styleTrainMsg, setStyleTrainMsg] = useState('')
+  const [styleBusy, setStyleBusy] = useState(false)
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
@@ -220,7 +236,12 @@ export default function App() {
     if (margin) setMarginBook(margin)
 
     try {
-      const [reg, stratPack, learn] = await Promise.all([api.regime(), api.strategies(), api.learning()])
+      const [reg, stratPack, learn, stylesPack] = await Promise.all([
+        api.regime(),
+        api.strategies(),
+        api.learning(),
+        api.styles(),
+      ])
       setRegimeInfo({
         regime: reg.regime.regime,
         summary: reg.regime.summary,
@@ -228,6 +249,7 @@ export default function App() {
       })
       setStrategyCount(stratPack.count)
       setLearningTop((learn.leaderboard || []).slice(0, 5))
+      setTradingStyles(stylesPack.styles || [])
     } catch {
       /* optional endpoints */
     }
@@ -516,6 +538,55 @@ export default function App() {
     // intentionally only when opening Search / F&O tabs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
+
+  const trainTradingStyles = async () => {
+    setStyleBusy(true)
+    setStatus('Training agent across trading styles (backtests → weights)…')
+    try {
+      const res = await api.trainStyles({
+        period: '6mo',
+        max_symbols_per_strategy: 2,
+      })
+      setTradingStyles(
+        (res.styles || []).map((s) => ({
+          id: s.id,
+          name: s.name,
+          holding_period: '',
+          risk: '',
+          instruments: [],
+          ai_suitability: s.ai_suitability,
+          ai_stars: '⭐'.repeat(s.ai_suitability),
+          strategy_count: s.strategy_count,
+          strategies_available: [],
+          notes: '',
+        })),
+      )
+      // Prefer full catalog refresh
+      try {
+        const pack = await api.styles()
+        setTradingStyles(pack.styles || [])
+      } catch {
+        /* keep partial */
+      }
+      setLearningTop((res.learning?.leaderboard || []).slice(0, 8))
+      setStrategyCount(res.strategy_count_catalog || strategyCount)
+      const top = (res.style_results || [])
+        .slice(0, 5)
+        .map((r) => `${r.name} (pnl ${inr(r.pnl)}, wr ${r.win_rate}%)`)
+        .join(' · ')
+      setStyleTrainMsg(
+        `Trained ${res.strategies_trained.length} strategies / ${res.backtests_run} backtests. Top: ${top || 'n/a'}`,
+      )
+      setStatus(
+        `Style training complete — ${res.strategies_trained.length} strategies updated (${res.backtests_run} backtests)`,
+      )
+    } catch (err) {
+      setStyleTrainMsg(`Train failed: ${(err as Error).message}`)
+      setStatus(`Style training failed: ${(err as Error).message}`)
+    } finally {
+      setStyleBusy(false)
+    }
+  }
 
   const setCapitalAbsolute = async () => {
     const n = Number(capitalDelta)
@@ -2117,6 +2188,60 @@ export default function App() {
 
           <section className="panel">
             <div className="panel-head">
+              <h2>Trading Styles · AI Self-Train</h2>
+              <div className="actions">
+                <button className="btn primary" type="button" disabled={busy || styleBusy} onClick={() => void trainTradingStyles()}>
+                  {styleBusy ? 'Training…' : 'Train All Styles'}
+                </button>
+              </div>
+            </div>
+            <p className="empty" style={{ marginBottom: '0.75rem' }}>
+              Catalog of {tradingStyles.length || 22} styles (scalping → investing). Training runs paper backtests and
+              updates strategy weights the regime selector uses.
+            </p>
+            {styleTrainMsg && <p className="prose">{styleTrainMsg}</p>}
+            {tradingStyles.length === 0 ? (
+              <p className="empty">Loading trading styles…</p>
+            ) : (
+              <div style={{ overflowX: 'auto', maxHeight: '420px' }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Style</th>
+                      <th>Hold</th>
+                      <th>Risk</th>
+                      <th>Instruments</th>
+                      <th>AI</th>
+                      <th>Strategies</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tradingStyles.map((s) => (
+                      <tr key={s.id}>
+                        <td>
+                          <strong>{s.name}</strong>
+                          {s.notes ? (
+                            <div style={{ color: 'var(--muted)', fontSize: '0.7rem' }}>{s.notes}</div>
+                          ) : null}
+                        </td>
+                        <td style={{ whiteSpace: 'nowrap' }}>{s.holding_period}</td>
+                        <td>{s.risk}</td>
+                        <td style={{ fontSize: '0.8rem' }}>{(s.instruments || []).join(', ')}</td>
+                        <td title={`${s.ai_suitability}/5`}>{s.ai_stars || '⭐'.repeat(s.ai_suitability || 0)}</td>
+                        <td style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
+                          {s.strategy_count} · {(s.strategies_available || []).slice(0, 3).join(', ')}
+                          {(s.strategies_available || []).length > 3 ? '…' : ''}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
               <h2>Positions</h2>
               <div className="actions">
                 <button className="btn" disabled={busy} onClick={mark}>
@@ -2240,6 +2365,17 @@ export default function App() {
                 <option value="swing_trend">swing_trend</option>
                 <option value="breakout">breakout</option>
                 <option value="intraday_mean_reversion">intraday_mean_reversion</option>
+                <option value="intraday_momentum">intraday_momentum</option>
+                <option value="scalping_micro">scalping_micro</option>
+                <option value="futures_trend">futures_trend</option>
+                <option value="futures_momentum">futures_momentum</option>
+                <option value="options_directional">options_directional</option>
+                <option value="algo_ensemble">algo_ensemble</option>
+                <option value="quant_zscore">quant_zscore</option>
+                <option value="growth_momentum">growth_momentum</option>
+                <option value="long_term_trend">long_term_trend</option>
+                <option value="value_mean_reversion">value_mean_reversion</option>
+                <option value="event_gap">event_gap</option>
               </select>
             </div>
             {btResult ? <pre className="report-box">{btResult}</pre> : <p className="empty">Run a 1Y backtest under the same 1% risk rules.</p>}

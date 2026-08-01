@@ -20,20 +20,32 @@ DEFAULT_BY_PRODUCT: dict[str, list[str]] = {
         "donchian_breakout",
         "smc_bos_fvg",
         "relative_strength",
+        "algo_ensemble",
+        "growth_momentum",
+        "position_hold",
     ],
     "INTRADAY": [
         "intraday_mean_reversion",
+        "intraday_momentum",
         "rsi_momentum",
         "vwap_bias",
         "opening_range_proxy",
         "bollinger_reversion",
+        "scalping_micro",
+        "news_volume_spike",
     ],
-    "FUTURES": ["futures_trend", "supertrend", "donchian_breakout", "adx_trend_strength"],
+    "FUTURES": [
+        "futures_trend",
+        "futures_momentum",
+        "futures_breakout",
+        "basis_arbitrage",
+    ],
     "OPTIONS": [
         "options_directional",
         "volatility_regime",
         "oi_pcr_bias",
         "options_straddle_bias",
+        "options_income_bias",
     ],
 }
 

@@ -57,6 +57,17 @@ FAMILY_REGIMES: dict[str, list[MarketRegime]] = {
     "relative_strength": [MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN],
     "pairs": [MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLUME],
     "fundamental": [MarketRegime.TRENDING_UP, MarketRegime.SIDEWAYS],
+    "scalping": [MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN, MarketRegime.VOLATILE],
+    "arbitrage": [MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLUME, MarketRegime.VOLATILE],
+    "event": [MarketRegime.VOLATILE, MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN],
+    "news": [MarketRegime.VOLATILE, MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN],
+    "quant": [
+        MarketRegime.TRENDING_UP,
+        MarketRegime.TRENDING_DOWN,
+        MarketRegime.SIDEWAYS,
+        MarketRegime.VOLATILE,
+    ],
+    "investing": [MarketRegime.TRENDING_UP, MarketRegime.SIDEWAYS, MarketRegime.LOW_VOLUME],
 }
 
 
@@ -84,27 +95,36 @@ class RegimeDetector:
             summary = "Low-volume regime — avoid aggressive breakouts."
         elif atr_pct >= 2.5 or (india_vix is not None and india_vix >= 18):
             regime = MarketRegime.VOLATILE
-            families = ["options_buy", "breakout", "momentum", "smc", "volatility"]
+            families = ["options_buy", "breakout", "momentum", "smc", "volatility", "scalping", "news", "event"]
             conf = 70.0
             summary = f"Volatile regime (ATR {atr_pct:.2f}%). Favor defined-risk / options."
         elif adx >= 25 and trend == MarketDirection.BULLISH:
             regime = MarketRegime.TRENDING_UP
-            families = ["trend", "momentum", "breakout", "relative_strength", "options_buy", "smc"]
+            families = [
+                "trend",
+                "momentum",
+                "breakout",
+                "relative_strength",
+                "options_buy",
+                "smc",
+                "quant",
+                "investing",
+            ]
             conf = min(90.0, 55 + adx)
             summary = f"Trending up (ADX {adx:.1f}) — trend & momentum favored."
         elif adx >= 25 and trend == MarketDirection.BEARISH:
             regime = MarketRegime.TRENDING_DOWN
-            families = ["trend", "momentum", "breakout", "options_buy", "smc"]
+            families = ["trend", "momentum", "breakout", "options_buy", "smc", "quant"]
             conf = min(90.0, 55 + adx)
             summary = f"Trending down (ADX {adx:.1f}) — shorts / puts favored."
         elif adx < 20 or trend in (MarketDirection.RANGE_BOUND, MarketDirection.NEUTRAL):
             regime = MarketRegime.SIDEWAYS
-            families = ["mean_reversion", "price_action", "options_sell", "pairs"]
+            families = ["mean_reversion", "price_action", "options_sell", "pairs", "arbitrage", "investing", "quant"]
             conf = 68.0
             summary = f"Sideways / range (ADX {adx:.1f}) — mean reversion favored."
         else:
             regime = MarketRegime.SIDEWAYS
-            families = ["mean_reversion", "price_action", "trend"]
+            families = ["mean_reversion", "price_action", "trend", "investing"]
             conf = 55.0
             summary = "Mixed regime — balanced strategy mix."
 

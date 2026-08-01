@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
 
+import quantx.analysis.additional_strategies  # noqa: F401
+import quantx.analysis.trading_styles  # noqa: F401
 from quantx.analysis.fno import DEFAULT_FO_UNIVERSE, is_index
 from quantx.analysis.learning import StrategyLearner
 from quantx.analysis.regime import RegimeDetector
@@ -24,9 +26,6 @@ from quantx.core.models import TradeRecommendation, TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST
 from quantx.execution.broker import PaperBroker
 from quantx.portfolio.manager import PortfolioManager
-
-# Ensure additive strategies are registered
-import quantx.analysis.additional_strategies  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

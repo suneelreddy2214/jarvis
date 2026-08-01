@@ -469,6 +469,58 @@ export const api = {
       mode: string
       note: string
     }>('/api/learning'),
+  styles: () =>
+    req<{
+      count: number
+      styles: Array<{
+        id: string
+        name: string
+        holding_period: string
+        risk: string
+        instruments: string[]
+        ai_suitability: number
+        ai_stars: string
+        strategies: string[]
+        strategies_available: string[]
+        strategy_count: number
+        trade_types: string[]
+        family: string
+        notes: string
+        trainable: boolean
+      }>
+      strategy_count: number
+      note?: string
+    }>('/api/styles'),
+  trainStyles: (opts: { symbols?: string[]; period?: string; style_ids?: string[]; max_symbols_per_strategy?: number } = {}) =>
+    req<{
+      ok: boolean
+      period: string
+      backtests_run: number
+      strategies_trained: string[]
+      strategy_count_catalog: number
+      styles: Array<{ id: string; name: string; ai_suitability: number; strategy_count: number }>
+      style_results: Array<{
+        style_id: string
+        name: string
+        ai_suitability: number
+        strategies_trained: string[]
+        backtests: number
+        trades: number
+        win_rate: number
+        pnl: number
+      }>
+      learning: { updates: number; leaderboard: Array<{ strategy: string; weight: number; win_rate: number; pnl: number }> }
+      errors: string[]
+      note: string
+    }>('/api/styles/train', {
+      method: 'POST',
+      body: JSON.stringify({
+        symbols: opts.symbols,
+        period: opts.period || '6mo',
+        style_ids: opts.style_ids,
+        max_symbols_per_strategy: opts.max_symbols_per_strategy ?? 2,
+      }),
+    }),
   paperAdjustCapital: (opts: { delta?: number; set_to?: number; reason?: string }) =>
     req<{
       ok: boolean

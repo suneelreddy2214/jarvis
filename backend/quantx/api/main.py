@@ -16,7 +16,9 @@ from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
 from quantx.analysis.option_chain import FnoSearchService, SEARCH_UNIVERSE
 from quantx.analysis.strategies import list_strategies
 import quantx.analysis.additional_strategies  # noqa: F401 — register additive strategies
+import quantx.analysis.trading_styles  # noqa: F401 — register style strategies
 from quantx.analysis.learning import StrategyLearner
+from quantx.analysis.trading_styles import get_trading_styles, train_trading_styles
 from quantx.analysis.regime import RegimeDetector
 from quantx.core.chat import QuantXChat
 from quantx.core.config import get_settings
@@ -200,6 +202,13 @@ class BacktestRequest(BaseModel):
     exchange: str = "NSE"
     period: str = "1y"
     capital: Optional[float] = None
+
+
+class StyleTrainRequest(BaseModel):
+    symbols: Optional[list[str]] = None
+    period: str = "6mo"
+    style_ids: Optional[list[str]] = None
+    max_symbols_per_strategy: int = 2
 
 
 class ChatRequest(BaseModel):
@@ -430,12 +439,42 @@ def execute(req: ExecuteRequest):
 
 @app.get("/api/strategies")
 def strategies():
+    styles = get_trading_styles()
     return {
         "count": len(list_strategies()),
         "strategies": list_strategies(),
+        "styles_count": len(styles),
+        "styles": styles,
         "learning": StrategyLearner(db).as_dict(),
-        "note": "Core strategies preserved; additional strategies registered additively.",
+        "note": "Core strategies preserved; additive + trading-style strategies registered. Self-train via POST /api/styles/train.",
     }
+
+
+@app.get("/api/styles")
+def trading_styles():
+    styles = get_trading_styles()
+    return {
+        "count": len(styles),
+        "styles": styles,
+        "strategy_count": len(list_strategies()),
+        "note": "Trading styles mapped to QuantX strategies for AI paper self-training.",
+    }
+
+
+@app.post("/api/styles/train")
+def train_styles(req: StyleTrainRequest):
+    try:
+        return train_trading_styles(
+            backtester=backtester,
+            learner=StrategyLearner(db),
+            symbols=req.symbols,
+            period=req.period,
+            style_ids=req.style_ids,
+            max_symbols_per_strategy=req.max_symbols_per_strategy,
+        )
+    except Exception as e:
+        logger.exception("Style training failed")
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/regime")
