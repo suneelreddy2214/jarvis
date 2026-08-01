@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
 
-from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
+from quantx.analysis.fno import DEFAULT_FO_UNIVERSE, is_index
 from quantx.analysis.learning import StrategyLearner
 from quantx.analysis.regime import RegimeDetector
 from quantx.analysis.selector import select_strategies_for_regime
@@ -45,6 +45,7 @@ class SessionStats:
     valid_signals: int = 0
     executed: int = 0
     rejected: int = 0
+    skipped: int = 0
     closed_by_mtm: int = 0
     last_cycle_at: Optional[str] = None
     last_message: str = "idle"
@@ -121,6 +122,7 @@ class PaperTradingAgent:
                 "valid_signals": self.stats.valid_signals,
                 "executed": self.stats.executed,
                 "rejected": self.stats.rejected,
+                "skipped": self.stats.skipped,
                 "closed_by_mtm": self.stats.closed_by_mtm,
                 "last_cycle_at": self.stats.last_cycle_at,
                 "last_message": self.stats.last_message,
@@ -357,7 +359,17 @@ class PaperTradingAgent:
             ):
                 best[key] = r
         recs = list(best.values())
-        recs.sort(key=lambda r: (not r.valid, -r.scores.confidence))
+        # Prefer index F&O and diversified SWING over stacking stock F&O
+        def _exec_rank(r: TradeRecommendation) -> tuple:
+            fo = r.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
+            idx = is_index(r.symbol)
+            # lower tuple sorts first: valid already filtered later
+            return (
+                0 if (fo and idx) else (1 if not fo else 2),
+                -r.scores.confidence,
+            )
+
+        recs.sort(key=lambda r: (not r.valid, *_exec_rank(r)))
         self.stats.last_strategies = sorted(set(used_strategies))
         self.stats.scanned += len(recs)
         valid = [r for r in recs if r.valid]
@@ -365,54 +377,61 @@ class PaperTradingAgent:
 
         executed: list[dict] = []
         rejected: list[dict] = []
+        skipped: list[dict] = []
+
+        def _skip(rec: TradeRecommendation, reason: str) -> None:
+            skipped.append(
+                {
+                    "symbol": rec.symbol,
+                    "trade_type": rec.trade_type.value,
+                    "reason": reason,
+                    "status": "SKIPPED",
+                }
+            )
+            self.stats.skipped += 1
 
         # 3) Auto-execute top valid (keyed by symbol+trade_type)
         if self.stats.auto_execute:
             max_pos = self.settings.risk.max_open_positions
-            paper_cfg = getattr(self.settings, "paper", None)
-            max_fo = 2
-            if isinstance(paper_cfg, dict):
-                max_fo = int(paper_cfg.get("max_fo_positions", 2))
+            paper_cfg = getattr(self.settings, "paper", None) or {}
+            if not isinstance(paper_cfg, dict):
+                paper_cfg = {}
+            max_fo = int(paper_cfg.get("max_fo_positions", 3))
+            max_per_sym = int(paper_cfg.get("max_positions_per_symbol", 1))
             opens_now = self.portfolio.db.list_positions("OPEN")
             open_keys = {(p.symbol, p.trade_type.value) for p in opens_now}
+            open_syms: dict[str, int] = {}
+            for p in opens_now:
+                open_syms[p.symbol] = open_syms.get(p.symbol, 0) + 1
             fo_open = sum(
                 1
                 for p in opens_now
                 if p.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
             )
             slots = max_pos - len(opens_now)
+            fo_skips_logged = False
+            slot_skips_logged = False
             for rec in valid:
                 key = (rec.symbol, rec.trade_type.value)
                 is_fo = rec.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
                 if slots <= 0:
-                    rejected.append(
-                        {
-                            "symbol": rec.symbol,
-                            "trade_type": rec.trade_type.value,
-                            "reason": "Max open positions — no free slot",
-                        }
-                    )
-                    self.stats.rejected += 1
+                    if not slot_skips_logged:
+                        _skip(rec, f"Max open positions ({max_pos}) — remaining signals skipped")
+                        slot_skips_logged = True
                     continue
                 if is_fo and fo_open >= max_fo:
-                    rejected.append(
-                        {
-                            "symbol": rec.symbol,
-                            "trade_type": rec.trade_type.value,
-                            "reason": f"Max F&O positions ({max_fo})",
-                        }
-                    )
-                    self.stats.rejected += 1
+                    if not fo_skips_logged:
+                        _skip(rec, f"Max F&O positions ({max_fo}/{max_fo}) — remaining F&O skipped")
+                        fo_skips_logged = True
                     continue
                 if key in open_keys:
-                    rejected.append(
-                        {
-                            "symbol": rec.symbol,
-                            "trade_type": rec.trade_type.value,
-                            "reason": "Already in position — no averaging",
-                        }
+                    _skip(rec, "Already in position — no averaging")
+                    continue
+                if open_syms.get(rec.symbol, 0) >= max_per_sym:
+                    _skip(
+                        rec,
+                        f"Max positions per symbol ({max_per_sym}) — diversify away from {rec.symbol}",
                     )
-                    self.stats.rejected += 1
                     continue
                 fill = self.broker.retry_safe(rec)
                 if fill.get("status") == "FILLED":
@@ -428,6 +447,7 @@ class PaperTradingAgent:
                         }
                     )
                     open_keys.add(key)
+                    open_syms[rec.symbol] = open_syms.get(rec.symbol, 0) + 1
                     slots -= 1
                     if is_fo:
                         fo_open += 1
@@ -438,6 +458,7 @@ class PaperTradingAgent:
                             "symbol": rec.symbol,
                             "trade_type": rec.trade_type.value,
                             "reason": fill.get("message", "rejected"),
+                            "status": "REJECTED",
                         }
                     )
                     self.stats.rejected += 1
@@ -446,7 +467,7 @@ class PaperTradingAgent:
             f"Cycle #{self.stats.cycles}: regime={regime.regime.value}, "
             f"strats={','.join(self.stats.last_strategies[:5])}, "
             f"MTM closed {closed}, valid {len(valid)}/{len(recs)}, "
-            f"executed {len(executed)}, rejected {len(rejected)}"
+            f"executed {len(executed)}, rejected {len(rejected)}, skipped {len(skipped)}"
         )
         self.stats.last_message = msg
         logger.info(msg)
@@ -459,8 +480,10 @@ class PaperTradingAgent:
             "valid_count": len(valid),
             "executed": executed,
             "rejected": rejected,
+            "skipped": skipped,
             "executed_count": len(executed),
             "rejected_count": len(rejected),
+            "skipped_count": len(skipped),
             "trade_types": types,
             "enable_fno": self.stats.enable_fno,
             "regime": regime.as_dict(),
@@ -477,6 +500,8 @@ class PaperTradingAgent:
 
     def _persist_cycle(self, result: dict) -> None:
         try:
+            # Store skipped alongside rejected (tagged) so UI can separate them
+            ledger = list(result.get("rejected") or []) + list(result.get("skipped") or [])
             self.portfolio.db.insert_cycle(
                 {
                     "cycle_no": result.get("cycle_no", self.stats.cycles),
@@ -487,7 +512,7 @@ class PaperTradingAgent:
                     "executed_count": result.get("executed_count", len(result.get("executed") or [])),
                     "rejected_count": result.get("rejected_count", len(result.get("rejected") or [])),
                     "executed": result.get("executed") or [],
-                    "rejected": result.get("rejected") or [],
+                    "rejected": ledger,
                     "created_at": result.get("created_at"),
                 }
             )
@@ -495,7 +520,36 @@ class PaperTradingAgent:
             logger.exception("Failed to persist cycle log")
 
     def list_cycles(self, limit: int = 50) -> list[dict]:
-        return self.portfolio.db.list_cycles(limit)
+        rows = self.portfolio.db.list_cycles(limit)
+        for row in rows:
+            ledger = row.get("rejected") or []
+            rejected = [x for x in ledger if (x.get("status") or "REJECTED") == "REJECTED"]
+            skipped = [x for x in ledger if x.get("status") == "SKIPPED"]
+            # Back-compat: old rows without status were capacity "rejections"
+            if not skipped and rejected:
+                soft = []
+                hard = []
+                for x in rejected:
+                    reason = str(x.get("reason") or "")
+                    if any(
+                        k in reason
+                        for k in (
+                            "Max open positions",
+                            "Max F&O positions",
+                            "Already in position",
+                            "Max positions per symbol",
+                            "remaining",
+                        )
+                    ):
+                        soft.append({**x, "status": "SKIPPED"})
+                    else:
+                        hard.append({**x, "status": "REJECTED"})
+                rejected, skipped = hard, soft
+            row["rejected"] = rejected
+            row["skipped"] = skipped
+            row["rejected_count"] = len(rejected)
+            row["skipped_count"] = len(skipped)
+        return rows
 
 
 # Process-wide singleton used by API

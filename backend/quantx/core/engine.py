@@ -142,13 +142,16 @@ class QuantXEngine:
         entry_cfg = self.settings.entry
         rejects: list[str] = []
 
-        if entry_cfg.require_trend and snap.trend in (MarketDirection.NEUTRAL, MarketDirection.RANGE_BOUND):
-            if not (strat and strat.name == "intraday_mean_reversion"):
+        # When a named strategy already produced a side, do not re-apply trend/momentum
+        # gates (they often double-reject valid strategy signals).
+        if strat is None:
+            if entry_cfg.require_trend and snap.trend in (MarketDirection.NEUTRAL, MarketDirection.RANGE_BOUND):
                 rejects.append("Trend not confirmed")
-        if entry_cfg.require_momentum and snap.momentum == "neutral":
-            if not (strat and strat.name == "intraday_mean_reversion"):
+            if entry_cfg.require_momentum and snap.momentum == "neutral":
                 rejects.append("Momentum not confirmed")
-        if entry_cfg.require_volume and snap.volume_ratio < 1.0 and not index_sym:
+        elif strat.name == "intraday_mean_reversion":
+            pass  # mean-reversion intentionally trades ranges / neutral momentum
+        if entry_cfg.require_volume and snap.volume_ratio < 0.85 and not index_sym:
             rejects.append("Volume not confirmed")
         # Fundamentals: skip / relax for index F&O
         if not index_sym and fund.score < entry_cfg.min_fundamental_score:

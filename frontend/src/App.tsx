@@ -56,7 +56,24 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [paperRunning, setPaperRunning] = useState(false)
   const [paperMsg, setPaperMsg] = useState('Session idle')
-  const [paperStats, setPaperStats] = useState({ cycles: 0, executed: 0, rejected: 0, valid: 0 })
+  const [cycles, setCycles] = useState<
+    Array<{
+      id: number
+      cycle_no: number
+      message: string
+      mtm_closed: number
+      scanned: number
+      valid_count: number
+      executed_count: number
+      rejected_count: number
+      skipped_count?: number
+      executed: Array<{ symbol: string; side?: string; quantity?: number; fill_price?: number; reason?: string; status?: string; message?: string }>
+      rejected: Array<{ symbol: string; reason: string; trade_type?: string; status?: string }>
+      skipped?: Array<{ symbol: string; reason: string; trade_type?: string; status?: string }>
+      created_at: string
+    }>
+  >([])
+  const [paperStats, setPaperStats] = useState({ cycles: 0, executed: 0, rejected: 0, skipped: 0, valid: 0 })
   const [perf, setPerf] = useState<{
     trades: number
     win_rate: number
@@ -108,21 +125,6 @@ export default function App() {
       price: number
       status: string
       message: string
-      created_at: string
-    }>
-  >([])
-  const [cycles, setCycles] = useState<
-    Array<{
-      id: number
-      cycle_no: number
-      message: string
-      mtm_closed: number
-      scanned: number
-      valid_count: number
-      executed_count: number
-      rejected_count: number
-      executed: Array<{ symbol: string; side?: string; quantity?: number; fill_price?: number; reason?: string; status?: string; message?: string }>
-      rejected: Array<{ symbol: string; reason: string }>
       created_at: string
     }>
   >([])
@@ -207,6 +209,7 @@ export default function App() {
         cycles: paper.session.cycles,
         executed: paper.session.executed,
         rejected: paper.session.rejected,
+        skipped: paper.session.skipped || 0,
         valid: paper.session.valid_signals,
       })
     }
@@ -534,21 +537,39 @@ export default function App() {
 
   const runScan = async () => {
     setBusy(true)
-    setStatus(enableFno || scanProduct === 'ALL' ? 'Scanning Stocks + F&O…' : `Scanning ${scanProduct}…`)
+    const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
+    // Product dropdown is the source of truth for Scan (checkbox is kept in sync).
+    const useFno = scanProduct === 'ALL'
+    const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
+    setStatus(
+      useFno
+        ? 'Scanning Stocks + F&O…'
+        : scanProduct === 'SWING'
+          ? 'Scanning Stocks only…'
+          : `Scanning ${scanProduct} only…`,
+    )
     try {
-      const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
-      const useFno = enableFno || scanProduct === 'ALL'
-      const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
       const res = await api.scan(list, {
         enable_fno: useFno,
-        trade_type: useFno ? 'SWING' : product,
+        trade_type: product,
       })
-      setRecs(res.recommendations)
-      const firstValid = res.recommendations.find((x) => x.valid) || res.recommendations[0] || null
+      const rows = res.recommendations || []
+      setRecs(rows)
+      const firstValid = rows.find((x) => x.valid) || rows[0] || null
       setSelected(firstValid)
-      setStatus(`Scan complete — ${res.valid_count}/${res.count} actionable setups`)
+      setStatus(
+        rows.length === 0
+          ? 'Scan returned no recommendations'
+          : `Scan complete — ${res.valid_count}/${res.count} actionable · ${
+              firstValid
+                ? `selected ${firstValid.symbol} ${firstValid.trade_type}${firstValid.valid ? '' : ' (rejected setup)'}`
+                : 'none selected'
+            }`,
+      )
       await refresh()
     } catch (err) {
+      setRecs([])
+      setSelected(null)
       setStatus(`Scan failed: ${(err as Error).message}`)
     } finally {
       setBusy(false)
@@ -1593,7 +1614,7 @@ export default function App() {
           </div>
           <p className="prose" style={{ marginBottom: '0.75rem' }}>
             Session {paperRunning ? 'RUNNING' : 'IDLE'} · total cycles {paperStats.cycles} · executed {paperStats.executed} ·
-            rejected {paperStats.rejected}. Last: {paperMsg}
+            rejected {paperStats.rejected} · skipped {paperStats.skipped || 0}. Last: {paperMsg}
           </p>
           {cycles.length === 0 ? (
             <p className="empty">No cycle history yet. Click Start Auto or Run Cycle.</p>
@@ -1606,6 +1627,7 @@ export default function App() {
                   <th>Valid</th>
                   <th>Filled</th>
                   <th>Rejected</th>
+                  <th>Skipped</th>
                   <th>MTM closed</th>
                   <th>Detail</th>
                 </tr>
@@ -1620,6 +1642,7 @@ export default function App() {
                     </td>
                     <td className="pos">{c.executed_count}</td>
                     <td className="warn">{c.rejected_count}</td>
+                    <td style={{ color: 'var(--muted)' }}>{c.skipped_count ?? c.skipped?.length ?? 0}</td>
                     <td>{c.mtm_closed}</td>
                     <td style={{ fontFamily: 'var(--font)', color: 'var(--muted)' }}>
                       <div>{c.message}</div>
@@ -1634,6 +1657,12 @@ export default function App() {
                       {c.rejected?.length > 0 && (
                         <div className="warn" style={{ fontSize: '0.75rem', marginTop: 2 }}>
                           Rejected: {c.rejected.map((x) => `${x.symbol} (${x.reason})`).join(' · ')}
+                        </div>
+                      )}
+                      {(c.skipped?.length || 0) > 0 && (
+                        <div style={{ fontSize: '0.75rem', marginTop: 2, color: 'var(--muted)' }}>
+                          Skipped (capacity):{' '}
+                          {c.skipped!.map((x) => `${x.symbol} ${x.trade_type || ''} (${x.reason})`).join(' · ')}
                         </div>
                       )}
                     </td>
@@ -1671,16 +1700,23 @@ export default function App() {
               <label className="chip" style={{ cursor: 'pointer' }}>
                 <input
                   type="checkbox"
-                  checked={enableFno}
-                  onChange={(e) => setEnableFno(e.target.checked)}
+                  checked={scanProduct === 'ALL' || enableFno}
+                  onChange={(e) => {
+                    const on = e.target.checked
+                    setEnableFno(on)
+                    setScanProduct(on ? 'ALL' : 'SWING')
+                  }}
                   style={{ marginRight: '0.4rem' }}
                 />
                 Include F&amp;O (Futures + Options)
               </label>
               <select
                 value={scanProduct}
-                onChange={(e) => setScanProduct(e.target.value as typeof scanProduct)}
-                disabled={enableFno}
+                onChange={(e) => {
+                  const v = e.target.value as typeof scanProduct
+                  setScanProduct(v)
+                  setEnableFno(v === 'ALL' || v === 'FUTURES' || v === 'OPTIONS')
+                }}
                 aria-label="Product"
               >
                 <option value="ALL">All products</option>
@@ -1689,7 +1725,9 @@ export default function App() {
                 <option value="OPTIONS">Options only</option>
               </select>
             </div>
-            {recs.length === 0 ? (
+            {busy && recs.length === 0 ? (
+              <p className="empty">Scanning…</p>
+            ) : recs.length === 0 ? (
               <p className="empty">Run a scan to generate Stocks and F&amp;O recommendations with confidence &amp; risk scores.</p>
             ) : (
               <table className="table">
@@ -1745,6 +1783,19 @@ export default function App() {
               <p className="empty">Select a recommendation to inspect entry, stops, targets, and rationale.</p>
             ) : (
               <div className="rec-detail">
+                <div className="panel-head" style={{ marginBottom: '0.75rem' }}>
+                  <h2 style={{ fontSize: '1.05rem' }}>
+                    {selected.symbol} · {selected.side} · {selected.trade_type}
+                  </h2>
+                  <span className={`pill ${selected.valid ? 'valid' : 'invalid'}`}>
+                    {selected.valid ? 'VALID' : 'REJECTED'}
+                  </span>
+                </div>
+                {!selected.valid && (
+                  <div className="emergency-banner" style={{ marginBottom: '0.75rem' }}>
+                    Rejected: {selected.rejection_reason || selected.reason || 'No trade setup'}
+                  </div>
+                )}
                 <div className="rec-grid">
                   <div className="rec-cell">
                     <span>Product</span>
@@ -1857,6 +1908,10 @@ export default function App() {
               <div className="rec-cell">
                 <span>Rejected</span>
                 <strong className="warn">{paperStats.rejected}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Skipped (slots)</span>
+                <strong style={{ color: 'var(--muted)' }}>{paperStats.skipped || 0}</strong>
               </div>
             </div>
             <label className="chip" style={{ display: 'inline-flex', marginTop: '0.75rem', cursor: paperRunning ? 'not-allowed' : 'pointer' }}>

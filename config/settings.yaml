@@ -78,7 +78,9 @@ paper:
   auto_execute: true
   default_interval_sec: 60
   enable_fno: true
-  max_fo_positions: 2
+  max_fo_positions: 3
+  # Cap how many products (SWING/FUT/OPT) can stack on one underlying
+  max_positions_per_symbol: 1
   fo_universe:
     - NIFTY
     - BANKNIFTY

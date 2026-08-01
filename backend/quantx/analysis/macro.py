@@ -44,10 +44,14 @@ class MacroAnalyzer:
         if india_vix is not None:
             ctx.vix_level = india_vix
             ctx.details["india_vix"] = india_vix
-            if india_vix >= 20:
+            if india_vix >= 25:
                 ctx.vix_regime = "elevated"
                 ctx.avoid_new_risk = True
-                parts.append(f"India VIX {india_vix:.1f} elevated — reduce size / avoid fresh risk")
+                parts.append(f"India VIX {india_vix:.1f} high — avoid fresh risk")
+            elif india_vix >= 20:
+                # Caution zone: size down via scoring, but do not hard-block every setup
+                ctx.vix_regime = "elevated"
+                parts.append(f"India VIX {india_vix:.1f} elevated — trade selectively")
             elif india_vix >= 15:
                 ctx.vix_regime = "moderate"
                 parts.append(f"India VIX {india_vix:.1f} moderate")
@@ -64,7 +68,8 @@ class MacroAnalyzer:
                 ctx.usdinr_bias = "inr_strong"
                 parts.append(f"USDINR {usdinr_change_pct:.2f}% (INR firm)")
 
-        if ctx.nifty_bias == "bearish" and ctx.vix_regime == "elevated":
+        # Hard risk-off only when trend is down AND vol is clearly elevated
+        if ctx.nifty_bias == "bearish" and ctx.vix_regime == "elevated" and (india_vix or 0) >= 22:
             ctx.global_risk = "risk_off"
             ctx.avoid_new_risk = True
         elif ctx.nifty_bias == "bullish" and ctx.vix_regime == "low":

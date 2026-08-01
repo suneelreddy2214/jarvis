@@ -89,7 +89,8 @@ class Settings(BaseModel):
         default_factory=lambda: {
             "auto_execute": True,
             "enable_fno": True,
-            "max_fo_positions": 2,
+            "max_fo_positions": 3,
+            "max_positions_per_symbol": 1,
         }
     )
     logging: dict[str, Any] = Field(default_factory=dict)
