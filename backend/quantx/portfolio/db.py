@@ -279,6 +279,17 @@ class Database:
     def order_exists(self, client_order_id: str) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM orders WHERE client_order_id=?", (client_order_id,)
+                "SELECT 1 FROM orders WHERE client_order_id=? AND status=?",
+                (client_order_id, "FILLED"),
             ).fetchone()
         return row is not None
+
+    def clear_orders(self) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM orders")
+
+    def clear_journal(self) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM journal")
+            conn.execute("DELETE FROM positions")
+

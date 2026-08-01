@@ -70,8 +70,24 @@ exit:
 
 broker:
   name: paper
+  slippage_bps: 5          # adverse fill slippage
   # Live credentials via environment variables only:
   # QUANTX_BROKER_API_KEY, QUANTX_BROKER_API_SECRET, QUANTX_BROKER_ACCESS_TOKEN
+
+paper:
+  auto_execute: true
+  default_interval_sec: 60
+  universe:
+    - RELIANCE
+    - TCS
+    - INFY
+    - HDFCBANK
+    - ICICIBANK
+    - SBIN
+    - BHARTIARTL
+    - ITC
+    - LT
+    - AXISBANK
 
 database:
   path: data/quantx.db

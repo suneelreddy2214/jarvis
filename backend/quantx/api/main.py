@@ -1,4 +1,4 @@
-"""QuantX FastAPI application — institutional trading agent API."""
+"""QuantX FastAPI — paper trading agent API."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from quantx.core.market_hours import MarketClock
 from quantx.core.models import TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST, MarketDataService
 from quantx.execution.broker import PaperBroker
+from quantx.execution.paper_agent import DEFAULT_PAPER_UNIVERSE, get_paper_agent
 from quantx.portfolio.db import Database
 from quantx.portfolio.manager import PortfolioManager
 from quantx.reports.generator import ReportGenerator
@@ -34,18 +35,21 @@ broker = PaperBroker(portfolio=portfolio, db=db, settings=settings)
 emergency = EmergencyController(portfolio=portfolio, risk=portfolio.risk, db=db)
 reports = ReportGenerator(portfolio=portfolio, engine=engine, data=market_data)
 clock = MarketClock(settings)
+paper_agent = get_paper_agent(portfolio=portfolio, engine=engine, broker=broker, settings=settings)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("QuantX %s starting in %s mode", __version__, settings.agent.mode)
     yield
+    if paper_agent.stats.running:
+        paper_agent.stop()
     logger.info("QuantX shutting down")
 
 
 app = FastAPI(
     title="QuantX",
-    description="Institutional-grade AI Trading Agent — Capital preservation first.",
+    description="Institutional paper trading agent — capital preservation first.",
     version=__version__,
     lifespan=lifespan,
 )
@@ -66,9 +70,7 @@ class AnalyzeRequest(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    symbols: list[str] = Field(default_factory=lambda: [
-        s.replace(".NS", "") for s in DEFAULT_WATCHLIST if s.endswith(".NS")
-    ][:8])
+    symbols: list[str] = Field(default_factory=lambda: list(DEFAULT_PAPER_UNIVERSE)[:8])
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
 
@@ -77,7 +79,6 @@ class ExecuteRequest(BaseModel):
     symbol: str
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
-    force_analyze: bool = True
 
 
 class CloseRequest(BaseModel):
@@ -95,6 +96,17 @@ class OverrideRequest(BaseModel):
     enabled: bool
 
 
+class PaperStartRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=lambda: list(DEFAULT_PAPER_UNIVERSE))
+    interval_sec: int = 60
+    auto_execute: bool = True
+    trade_type: TradeType = TradeType.SWING
+
+
+class PaperResetRequest(BaseModel):
+    confirm: bool = False
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -102,6 +114,7 @@ def health():
         "version": __version__,
         "mode": settings.agent.mode,
         "status": "ok",
+        "paper_session": paper_agent.stats.running,
         "mission": "Protect capital first. Generate consistent profits second.",
     }
 
@@ -114,6 +127,11 @@ def session():
 @app.get("/api/portfolio")
 def get_portfolio():
     return portfolio.snapshot().model_dump()
+
+
+@app.get("/api/performance")
+def get_performance():
+    return portfolio.performance()
 
 
 @app.get("/api/risk")
@@ -175,6 +193,43 @@ def execute(req: ExecuteRequest):
     return result
 
 
+# —— Paper trading session ——
+@app.get("/api/paper/status")
+def paper_status():
+    return paper_agent.status()
+
+
+@app.post("/api/paper/start")
+def paper_start(req: PaperStartRequest):
+    if settings.agent.mode != "paper":
+        raise HTTPException(400, "Agent mode is not paper")
+    return paper_agent.start(
+        symbols=req.symbols,
+        interval_sec=req.interval_sec,
+        auto_execute=req.auto_execute,
+        trade_type=req.trade_type,
+    )
+
+
+@app.post("/api/paper/stop")
+def paper_stop():
+    return paper_agent.stop()
+
+
+@app.post("/api/paper/cycle")
+def paper_cycle():
+    """Run one paper scan/execute/MTM cycle immediately."""
+    return paper_agent.run_once()
+
+
+@app.post("/api/paper/reset")
+def paper_reset(req: PaperResetRequest):
+    result = paper_agent.reset_account(confirm=req.confirm)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("message", "Reset refused"))
+    return result
+
+
 @app.get("/api/journal")
 def journal(limit: int = 50):
     return [j.model_dump(mode="json") for j in db.list_journal(limit)]
@@ -194,14 +249,10 @@ def macro():
 def watchlist():
     quotes = []
     for sym in DEFAULT_WATCHLIST:
-        if sym.startswith("^") or "=" in sym:
-            try:
-                quotes.append(market_data.get_quote(sym, "NSE"))
-            except Exception:
-                continue
-            continue
         try:
-            quotes.append(market_data.get_quote(sym.replace(".NS", "").replace(".BO", ""), "NSE"))
+            quotes.append(
+                market_data.get_quote(sym.replace(".NS", "").replace(".BO", ""), "NSE")
+            )
         except Exception:
             continue
     return quotes
@@ -257,4 +308,6 @@ def get_config():
         "markets": settings.markets.model_dump(),
         "entry": settings.entry.model_dump(),
         "exit": settings.exit.model_dump(),
+        "broker": settings.broker,
+        "paper_universe": DEFAULT_PAPER_UNIVERSE,
     }

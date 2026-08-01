@@ -168,6 +168,50 @@ export const api = {
     }),
   panicExit: () => req<{ closed: Position[]; emergency: EmergencyState }>('/api/emergency/panic-exit', { method: 'POST' }),
   report: (type: string) => req<{ title: string; summary: string; sections: Record<string, unknown> }>(`/api/reports/${type}`),
+  performance: () =>
+    req<{
+      trades: number
+      wins: number
+      losses: number
+      win_rate: number
+      total_realized_pnl: number
+      avg_win: number
+      avg_loss: number
+      expectancy: number
+      total_fees: number
+      capital: number
+      drawdown_pct: number
+      open_positions: number
+    }>('/api/performance'),
+  paperStatus: () =>
+    req<{
+      session: {
+        running: boolean
+        auto_execute: boolean
+        cycles: number
+        executed: number
+        rejected: number
+        valid_signals: number
+        closed_by_mtm: number
+        last_message: string
+        interval_sec: number
+        symbols: string[]
+      }
+      portfolio: PortfolioSnapshot
+      risk: RiskStatus
+    }>('/api/paper/status'),
+  paperStart: (symbols: string[], interval_sec = 60, auto_execute = true) =>
+    req<Record<string, unknown>>('/api/paper/start', {
+      method: 'POST',
+      body: JSON.stringify({ symbols, interval_sec, auto_execute, trade_type: 'SWING' }),
+    }),
+  paperStop: () => req<Record<string, unknown>>('/api/paper/stop', { method: 'POST' }),
+  paperCycle: () => req<Record<string, unknown>>('/api/paper/cycle', { method: 'POST' }),
+  paperReset: (confirm: boolean) =>
+    req<Record<string, unknown>>('/api/paper/reset', {
+      method: 'POST',
+      body: JSON.stringify({ confirm }),
+    }),
 }
 
 export const inr = (n: number) =>

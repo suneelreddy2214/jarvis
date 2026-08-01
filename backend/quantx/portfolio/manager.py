@@ -105,12 +105,13 @@ class PortfolioManager:
         if not ok:
             raise ValueError("; ".join(reasons))
 
-        # Never average losing trades
+        # Never average / pyramid into an existing symbol (paper safety)
         opens = self.db.list_positions("OPEN")
         for p in opens:
-            if p.symbol == rec.symbol and p.side == rec.side and p.pnl < 0:
+            if p.symbol == rec.symbol:
                 raise ValueError(
-                    f"Refusing to average losing {p.symbol} position (PnL {p.pnl:.2f}). Safety rule."
+                    f"Refusing to add to existing {p.symbol} position "
+                    f"(side={p.side.value}, PnL {p.pnl:.2f}). No averaging."
                 )
 
         pos = Position(
@@ -190,21 +191,48 @@ class PortfolioManager:
                 updated.append(p)
         return self.db.list_positions("OPEN")
 
+    def charge_fees(self, amount: float, note: str = "") -> None:
+        """Deduct paper trading costs from capital (does not count as a trade loss streak)."""
+        if amount <= 0:
+            return
+        self._hydrate_risk_from_db()
+        self.risk.state.capital -= amount
+        self.risk.state.daily_realized_pnl -= amount
+        self.risk.state.weekly_realized_pnl -= amount
+        self._persist_risk()
+        fees = self.db.get_state("total_fees", 0.0) + amount
+        self.db.set_state("total_fees", fees)
+        if note:
+            self.db.set_state("last_fee_note", note)
+
     def close_position(self, position_id: int, exit_price: float, reason: str) -> Position:
+        from quantx.execution.costs import PaperCostModel
+
         self._hydrate_risk_from_db()
         p = self.db.get_position(position_id)
         if not p or p.status != PositionStatus.OPEN:
             raise ValueError("Position not found or already closed")
 
-        p.exit_price = exit_price
-        p.current_price = exit_price
+        costs = PaperCostModel(
+            slippage_bps=float((self.settings.broker or {}).get("slippage_bps", 5))
+            if isinstance(self.settings.broker, dict)
+            else 5.0
+        )
+        slipped_exit = costs.apply_slippage(exit_price, p.side, is_entry=False)
+        style = "intraday" if p.trade_type.value == "INTRADAY" else "swing"
+        fee = costs.estimate(p.entry_price, slipped_exit, p.quantity, p.side, style)  # type: ignore[arg-type]
+        exit_fee = fee.total * 0.5  # entry half already charged
+
+        p.exit_price = slipped_exit
+        p.current_price = slipped_exit
         p.closed_at = datetime.utcnow()
         p.exit_reason = reason
         p.status = PositionStatus.CLOSED
         if p.side == Side.BUY:
-            p.pnl = (exit_price - p.entry_price) * p.quantity
+            gross = (slipped_exit - p.entry_price) * p.quantity
         else:
-            p.pnl = (p.entry_price - exit_price) * p.quantity
+            gross = (p.entry_price - slipped_exit) * p.quantity
+        p.pnl = gross - exit_fee
         notional = p.entry_price * p.quantity
         p.pnl_pct = (p.pnl / notional * 100) if notional else 0
         self.db.update_position(p)
@@ -212,19 +240,21 @@ class PortfolioManager:
         self.risk.register_trade_result(p.pnl)
         self.risk.update_state(open_positions=len(self.db.list_positions("OPEN")))
         self._persist_risk()
+        fees = self.db.get_state("total_fees", 0.0) + exit_fee
+        self.db.set_state("total_fees", fees)
 
         entry = TradeJournalEntry(
             symbol=p.symbol,
             side=p.side,
             trade_type=p.trade_type,
             entry=p.entry_price,
-            exit=exit_price,
+            exit=slipped_exit,
             quantity=p.quantity,
             pnl=p.pnl,
             pnl_pct=p.pnl_pct,
             reason=p.reason,
             mistakes="" if p.pnl >= 0 else "Review entry timing / stop placement",
-            market_condition=reason,
+            market_condition=f"{reason} | exit fee ₹{exit_fee:.2f}",
             confidence=p.confidence,
             lessons="Follow risk rules; never remove stop." if p.pnl < 0 else "Plan worked — journal what confirmed.",
             opened_at=p.opened_at,
@@ -232,6 +262,33 @@ class PortfolioManager:
         )
         self.db.insert_journal(entry)
         return p
+
+    def performance(self) -> dict:
+        journal = self.db.list_journal(500)
+        wins = [j for j in journal if j.pnl > 0]
+        losses = [j for j in journal if j.pnl <= 0]
+        total_pnl = sum(j.pnl for j in journal)
+        win_rate = len(wins) / len(journal) * 100 if journal else 0.0
+        avg_win = sum(j.pnl for j in wins) / len(wins) if wins else 0.0
+        avg_loss = sum(j.pnl for j in losses) / len(losses) if losses else 0.0
+        expectancy = (
+            avg_win * (win_rate / 100) + avg_loss * (1 - win_rate / 100) if journal else 0.0
+        )
+        snap = self.snapshot()
+        return {
+            "trades": len(journal),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 2),
+            "total_realized_pnl": round(total_pnl, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "expectancy": round(expectancy, 2),
+            "total_fees": round(self.db.get_state("total_fees", 0.0), 2),
+            "capital": snap.capital,
+            "drawdown_pct": snap.drawdown_pct,
+            "open_positions": snap.open_positions,
+        }
 
     def panic_exit_all(self) -> list[Position]:
         closed = []

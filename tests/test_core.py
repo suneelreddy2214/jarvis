@@ -193,5 +193,5 @@ def test_never_average_losers_logic(tmp_path, settings):
         valid=True,
     )
     # Make risk accept size
-    with pytest.raises(ValueError, match="average losing"):
+    with pytest.raises(ValueError, match="No averaging|average|existing"):
         pm.open_from_recommendation(rec)

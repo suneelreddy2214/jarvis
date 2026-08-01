@@ -51,12 +51,22 @@ export default function App() {
   const [recs, setRecs] = useState<TradeRecommendation[]>([])
   const [selected, setSelected] = useState<TradeRecommendation | null>(null)
   const [reportText, setReportText] = useState('')
-  const [status, setStatus] = useState('Ready — capital preservation mode')
+  const [status, setStatus] = useState('Ready — paper trading mode')
   const [busy, setBusy] = useState(false)
+  const [paperRunning, setPaperRunning] = useState(false)
+  const [paperMsg, setPaperMsg] = useState('Session idle')
+  const [paperStats, setPaperStats] = useState({ cycles: 0, executed: 0, rejected: 0, valid: 0 })
+  const [perf, setPerf] = useState<{
+    trades: number
+    win_rate: number
+    total_realized_pnl: number
+    expectancy: number
+    total_fees: number
+  } | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [p, r, s, pos, j, w, e] = await Promise.all([
+      const [p, r, s, pos, j, w, e, paper, performance] = await Promise.all([
         api.portfolio(),
         api.risk(),
         api.session(),
@@ -64,6 +74,8 @@ export default function App() {
         api.journal(),
         api.watchlist(),
         api.emergency(),
+        api.paperStatus(),
+        api.performance(),
       ])
       setPortfolio(p)
       setRisk(r)
@@ -72,6 +84,15 @@ export default function App() {
       setJournal(j)
       setWatchlist(w)
       setEmergency(e)
+      setPaperRunning(paper.session.running)
+      setPaperMsg(paper.session.last_message)
+      setPaperStats({
+        cycles: paper.session.cycles,
+        executed: paper.session.executed,
+        rejected: paper.session.rejected,
+        valid: paper.session.valid_signals,
+      })
+      setPerf(performance)
     } catch (err) {
       setStatus(`Backend offline — start API on :8000 (${(err as Error).message})`)
     }
@@ -79,9 +100,71 @@ export default function App() {
 
   useEffect(() => {
     refresh()
-    const id = setInterval(refresh, 20000)
+    const id = setInterval(refresh, paperRunning ? 8000 : 20000)
     return () => clearInterval(id)
-  }, [refresh])
+  }, [refresh, paperRunning])
+
+  const startPaper = async () => {
+    setBusy(true)
+    try {
+      const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
+      await api.paperStart(list, 60, true)
+      setStatus('Paper session STARTED — auto scan/execute under risk gates')
+      await refresh()
+    } catch (err) {
+      setStatus(`Start failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stopPaper = async () => {
+    setBusy(true)
+    try {
+      await api.paperStop()
+      setStatus('Paper session stopped')
+      await refresh()
+    } catch (err) {
+      setStatus(`Stop failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runPaperCycle = async () => {
+    setBusy(true)
+    setStatus('Running one paper cycle…')
+    try {
+      const res = await api.paperCycle()
+      const signals = (res.signals as TradeRecommendation[] | undefined) || []
+      if (signals.length) {
+        setRecs(signals)
+        setSelected(signals.find((x) => x.valid) || signals[0])
+      }
+      setStatus(String(res.message || 'Cycle complete'))
+      await refresh()
+    } catch (err) {
+      setStatus(`Cycle failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const resetPaper = async () => {
+    if (!confirm('Reset paper account to ₹10,00,000 and clear open positions?')) return
+    setBusy(true)
+    try {
+      await api.paperReset(true)
+      setStatus('Paper account reset')
+      setRecs([])
+      setSelected(null)
+      await refresh()
+    } catch (err) {
+      setStatus(`Reset failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const runScan = async () => {
     setBusy(true)
@@ -203,14 +286,14 @@ export default function App() {
         <div className="brand-block">
           <h1 className="brand">QuantX</h1>
           <p className="tagline">
-            Institutional trading agent for NSE/BSE — capital preservation first, risk-adjusted returns second.
-            Never revenge trade. Never exceed risk limits.
+            Paper trading agent for NSE/BSE — capital preservation first. Auto-scan, sized entries,
+            slippage + fees, trailing stops. Never revenge trade.
           </p>
         </div>
         <div className="session-chip">
-          <span className={`badge${session?.is_open ? ' open' : ''}${halted ? ' halted' : ''}`}>
+          <span className={`badge${paperRunning ? ' open' : ''}${halted ? ' halted' : ''}`}>
             <span className="dot" />
-            {halted ? 'HALTED' : session?.phase?.replace('_', ' ') || '…'} · {portfolio?.mode || 'paper'}
+            {halted ? 'HALTED' : paperRunning ? 'PAPER LIVE' : session?.phase?.replace('_', ' ') || '…'} · paper
           </span>
           <span>{session?.server_time_ist || '—'}</span>
         </div>
@@ -397,6 +480,57 @@ export default function App() {
         </div>
 
         <div className="stack">
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Paper Session</h2>
+              <div className="actions">
+                {!paperRunning ? (
+                  <button className="btn primary" disabled={busy} onClick={startPaper}>
+                    Start Auto
+                  </button>
+                ) : (
+                  <button className="btn warn" disabled={busy} onClick={stopPaper}>
+                    Stop
+                  </button>
+                )}
+                <button className="btn" disabled={busy} onClick={runPaperCycle}>
+                  Run Cycle
+                </button>
+                <button className="btn" disabled={busy || paperRunning} onClick={resetPaper}>
+                  Reset
+                </button>
+              </div>
+            </div>
+            <div className="rec-grid">
+              <div className="rec-cell">
+                <span>Status</span>
+                <strong className={paperRunning ? 'pos' : ''}>{paperRunning ? 'RUNNING' : 'IDLE'}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Cycles</span>
+                <strong>{paperStats.cycles}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Executed</span>
+                <strong className="pos">{paperStats.executed}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Rejected</span>
+                <strong className="warn">{paperStats.rejected}</strong>
+              </div>
+            </div>
+            <p className="prose" style={{ marginTop: '0.75rem' }}>
+              <strong>Last cycle.</strong> {paperMsg}
+            </p>
+            {perf && (
+              <p className="prose">
+                <strong>Performance.</strong> {perf.trades} trades · win {perf.win_rate.toFixed(1)}% · realized{' '}
+                <span className={perf.total_realized_pnl >= 0 ? 'pos' : 'neg'}>{inr(perf.total_realized_pnl)}</span> ·
+                expectancy {inr(perf.expectancy)} · fees {inr(perf.total_fees)}
+              </p>
+            )}
+          </section>
+
           <section className="panel">
             <div className="panel-head">
               <h2>Positions</h2>
