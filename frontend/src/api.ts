@@ -212,6 +212,36 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ confirm }),
     }),
+  orders: () =>
+    req<
+      Array<{
+        id: number
+        client_order_id: string
+        symbol: string
+        side: string
+        quantity: number
+        price: number
+        status: string
+        message: string
+        created_at: string
+      }>
+    >('/api/orders'),
+  cycles: () =>
+    req<
+      Array<{
+        id: number
+        cycle_no: number
+        message: string
+        mtm_closed: number
+        scanned: number
+        valid_count: number
+        executed_count: number
+        rejected_count: number
+        executed: Array<{ symbol: string; side?: string; quantity?: number; fill_price?: number; reason?: string; status?: string; message?: string }>
+        rejected: Array<{ symbol: string; reason: string }>
+        created_at: string
+      }>
+    >('/api/paper/cycles'),
   strategies: () => req<Array<{ name: string; trade_type: string; class: string }>>('/api/strategies'),
   backtest: (symbol: string, strategy = 'swing_trend', period = '1y') =>
     req<{

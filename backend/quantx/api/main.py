@@ -286,6 +286,16 @@ def journal(limit: int = 50):
     return [j.model_dump(mode="json") for j in db.list_journal(limit)]
 
 
+@app.get("/api/orders")
+def get_orders(limit: int = 100):
+    return db.list_orders(limit)
+
+
+@app.get("/api/paper/cycles")
+def paper_cycles(limit: int = 50):
+    return paper_agent.list_cycles(limit)
+
+
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str, exchange: str = "NSE"):
     return market_data.get_quote(symbol, exchange)

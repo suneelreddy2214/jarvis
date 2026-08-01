@@ -67,10 +67,39 @@ export default function App() {
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
+  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles'>('overview')
+  const [orders, setOrders] = useState<
+    Array<{
+      id: number
+      client_order_id: string
+      symbol: string
+      side: string
+      quantity: number
+      price: number
+      status: string
+      message: string
+      created_at: string
+    }>
+  >([])
+  const [cycles, setCycles] = useState<
+    Array<{
+      id: number
+      cycle_no: number
+      message: string
+      mtm_closed: number
+      scanned: number
+      valid_count: number
+      executed_count: number
+      rejected_count: number
+      executed: Array<{ symbol: string; side?: string; quantity?: number; fill_price?: number; reason?: string; status?: string; message?: string }>
+      rejected: Array<{ symbol: string; reason: string }>
+      created_at: string
+    }>
+  >([])
 
   const refresh = useCallback(async () => {
     try {
-      const [p, r, s, pos, j, w, e, paper, performance] = await Promise.all([
+      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc] = await Promise.all([
         api.portfolio(),
         api.risk(),
         api.session(),
@@ -80,6 +109,8 @@ export default function App() {
         api.emergency(),
         api.paperStatus(),
         api.performance(),
+        api.orders(),
+        api.cycles(),
       ])
       setPortfolio(p)
       setRisk(r)
@@ -97,6 +128,8 @@ export default function App() {
         valid: paper.session.valid_signals,
       })
       setPerf(performance)
+      setOrders(ords)
+      setCycles(cyc)
     } catch (err) {
       setStatus(`Backend offline — start API on :8000 (${(err as Error).message})`)
     }
@@ -374,6 +407,133 @@ export default function App() {
         </div>
       </section>
 
+      <nav className="tabs">
+        <button className={`tab${tab === 'overview' ? ' active' : ''}`} onClick={() => setTab('overview')} type="button">
+          Overview
+        </button>
+        <button className={`tab${tab === 'orders' ? ' active' : ''}`} onClick={() => setTab('orders')} type="button">
+          Orders<span className="count">{orders.length}</span>
+        </button>
+        <button className={`tab${tab === 'cycles' ? ' active' : ''}`} onClick={() => setTab('cycles')} type="button">
+          Cycles<span className="count">{paperStats.cycles || cycles.length}</span>
+        </button>
+      </nav>
+
+      {tab === 'orders' && (
+        <section className="panel" style={{ marginBottom: '1rem' }}>
+          <div className="panel-head">
+            <h2>Orders</h2>
+            <div className="actions">
+              <button className="btn" disabled={busy} onClick={refresh}>
+                Refresh
+              </button>
+            </div>
+          </div>
+          {orders.length === 0 ? (
+            <p className="empty">No orders yet. Start Auto or Run Cycle to generate paper fills.</p>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Qty</th>
+                  <th>Price</th>
+                  <th>Status</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map((o) => (
+                  <tr key={o.id}>
+                    <td style={{ whiteSpace: 'nowrap' }}>{(o.created_at || '').replace('T', ' ').slice(0, 19)}</td>
+                    <td>{o.symbol}</td>
+                    <td>
+                      <span className={`pill ${o.side === 'BUY' ? 'buy' : 'sell'}`}>{o.side}</span>
+                    </td>
+                    <td>{o.quantity}</td>
+                    <td>{o.price?.toFixed?.(2) ?? o.price}</td>
+                    <td>
+                      <span className={`pill ${o.status === 'FILLED' ? 'valid' : 'invalid'}`}>{o.status}</span>
+                    </td>
+                    <td style={{ fontFamily: 'var(--font)', color: 'var(--muted)', maxWidth: 280 }}>{o.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
+
+      {tab === 'cycles' && (
+        <section className="panel" style={{ marginBottom: '1rem' }}>
+          <div className="panel-head">
+            <h2>Paper Cycles</h2>
+            <div className="actions">
+              <button className="btn" disabled={busy} onClick={refresh}>
+                Refresh
+              </button>
+              <button className="btn" disabled={busy} onClick={runPaperCycle}>
+                Run Cycle
+              </button>
+            </div>
+          </div>
+          <p className="prose" style={{ marginBottom: '0.75rem' }}>
+            Session {paperRunning ? 'RUNNING' : 'IDLE'} · total cycles {paperStats.cycles} · executed {paperStats.executed} ·
+            rejected {paperStats.rejected}. Last: {paperMsg}
+          </p>
+          {cycles.length === 0 ? (
+            <p className="empty">No cycle history yet. Click Start Auto or Run Cycle.</p>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Time</th>
+                  <th>Valid</th>
+                  <th>Filled</th>
+                  <th>Rejected</th>
+                  <th>MTM closed</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cycles.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.cycle_no}</td>
+                    <td style={{ whiteSpace: 'nowrap' }}>{(c.created_at || '').replace('T', ' ').slice(0, 19)}</td>
+                    <td>
+                      {c.valid_count}/{c.scanned}
+                    </td>
+                    <td className="pos">{c.executed_count}</td>
+                    <td className="warn">{c.rejected_count}</td>
+                    <td>{c.mtm_closed}</td>
+                    <td style={{ fontFamily: 'var(--font)', color: 'var(--muted)' }}>
+                      <div>{c.message}</div>
+                      {c.executed?.length > 0 && (
+                        <div className="pos" style={{ fontSize: '0.75rem', marginTop: 4 }}>
+                          Filled:{' '}
+                          {c.executed
+                            .map((x) => `${x.symbol} ${x.side || ''} ${x.quantity || ''}@${x.fill_price ?? ''}`)
+                            .join(' · ')}
+                        </div>
+                      )}
+                      {c.rejected?.length > 0 && (
+                        <div className="warn" style={{ fontSize: '0.75rem', marginTop: 2 }}>
+                          Rejected: {c.rejected.map((x) => `${x.symbol} (${x.reason})`).join(' · ')}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
+
+      {tab === 'overview' && (
       <div className="grid">
         <div className="stack">
           <section className="panel">
@@ -731,6 +891,7 @@ export default function App() {
           </section>
         </div>
       </div>
+      )}
 
       <p className="status-line">{status}</p>
     </div>

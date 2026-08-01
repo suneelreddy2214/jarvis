@@ -157,6 +157,7 @@ class PaperTradingAgent:
         # Flat reset of paper books
         self.portfolio.db.clear_orders()
         self.portfolio.db.clear_journal()
+        self.portfolio.db.clear_cycles()
         initial = self.settings.capital.initial
         self.portfolio.risk.update_state(
             capital=initial,
@@ -210,7 +211,18 @@ class PaperTradingAgent:
         if not risk.can_trade:
             msg = f"Risk halt — skipping new entries ({'; '.join(risk.reasons) or 'halted'})"
             self.stats.last_message = msg
-            result = {"mtm_closed": closed, "executed": [], "rejected": [], "signals": [], "message": msg}
+            result = {
+                "cycle_no": self.stats.cycles,
+                "mtm_closed": closed,
+                "executed": [],
+                "rejected": [],
+                "signals": [],
+                "scanned": 0,
+                "valid_count": 0,
+                "message": msg,
+                "created_at": self.stats.last_cycle_at,
+            }
+            self._persist_cycle(result)
             if self._on_cycle:
                 self._on_cycle(result)
             return result
@@ -232,14 +244,25 @@ class PaperTradingAgent:
             slots = max_pos - len(open_syms)
             for rec in valid:
                 if slots <= 0:
-                    break
+                    rejected.append({"symbol": rec.symbol, "reason": "Max open positions — no free slot"})
+                    self.stats.rejected += 1
+                    continue
                 if rec.symbol in open_syms:
                     rejected.append({"symbol": rec.symbol, "reason": "Already in position — no averaging"})
                     self.stats.rejected += 1
                     continue
                 fill = self.broker.retry_safe(rec)
                 if fill.get("status") == "FILLED":
-                    executed.append(fill)
+                    executed.append(
+                        {
+                            "symbol": rec.symbol,
+                            "side": rec.side.value,
+                            "quantity": rec.quantity,
+                            "fill_price": fill.get("fill_price", rec.entry),
+                            "status": "FILLED",
+                            "message": fill.get("message", ""),
+                        }
+                    )
                     open_syms.add(rec.symbol)
                     slots -= 1
                     self.stats.executed += 1
@@ -255,17 +278,45 @@ class PaperTradingAgent:
         logger.info(msg)
 
         result = {
+            "cycle_no": self.stats.cycles,
             "mtm_closed": closed,
             "signals": [r.model_dump(mode="json") for r in recs],
+            "scanned": len(recs),
             "valid_count": len(valid),
             "executed": executed,
             "rejected": rejected,
+            "executed_count": len(executed),
+            "rejected_count": len(rejected),
             "message": msg,
             "portfolio": self.portfolio.snapshot().model_dump(),
+            "created_at": self.stats.last_cycle_at,
         }
+        self._persist_cycle(result)
         if self._on_cycle:
             self._on_cycle(result)
         return result
+
+    def _persist_cycle(self, result: dict) -> None:
+        try:
+            self.portfolio.db.insert_cycle(
+                {
+                    "cycle_no": result.get("cycle_no", self.stats.cycles),
+                    "message": result.get("message", ""),
+                    "mtm_closed": result.get("mtm_closed", 0),
+                    "scanned": result.get("scanned", 0),
+                    "valid_count": result.get("valid_count", 0),
+                    "executed_count": result.get("executed_count", len(result.get("executed") or [])),
+                    "rejected_count": result.get("rejected_count", len(result.get("rejected") or [])),
+                    "executed": result.get("executed") or [],
+                    "rejected": result.get("rejected") or [],
+                    "created_at": result.get("created_at"),
+                }
+            )
+        except Exception:
+            logger.exception("Failed to persist cycle log")
+
+    def list_cycles(self, limit: int = 50) -> list[dict]:
+        return self.portfolio.db.list_cycles(limit)
 
 
 # Process-wide singleton used by API

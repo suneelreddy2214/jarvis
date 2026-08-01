@@ -529,11 +529,43 @@ button {
   animation: fadeUp 0.35s ease both;
 }
 
-.status-line {
-  margin-top: 0.75rem;
+.tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.65rem;
+}
+
+.tab {
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--muted);
-  font-size: 0.8rem;
+  border-radius: 8px;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.84rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.tab.active {
+  color: var(--text);
+  background: var(--bg-3);
+  border-color: rgba(62, 207, 172, 0.35);
+}
+
+.tab .count {
+  margin-left: 0.35rem;
   font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--teal);
 }
 
 .report-box {

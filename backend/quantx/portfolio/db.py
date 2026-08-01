@@ -105,6 +105,20 @@ class Database:
                     message TEXT,
                     created_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_no INTEGER NOT NULL,
+                    message TEXT,
+                    mtm_closed INTEGER DEFAULT 0,
+                    scanned INTEGER DEFAULT 0,
+                    valid_count INTEGER DEFAULT 0,
+                    executed_count INTEGER DEFAULT 0,
+                    rejected_count INTEGER DEFAULT 0,
+                    executed_json TEXT,
+                    rejected_json TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -292,4 +306,145 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM journal")
             conn.execute("DELETE FROM positions")
+
+    def list_orders(self, limit: int = 100) -> list[dict]:
+        with self.connect() as conn:
+            # Ensure cycles table exists for older DBs
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_no INTEGER NOT NULL,
+                    message TEXT,
+                    mtm_closed INTEGER DEFAULT 0,
+                    scanned INTEGER DEFAULT 0,
+                    valid_count INTEGER DEFAULT 0,
+                    executed_count INTEGER DEFAULT 0,
+                    rejected_count INTEGER DEFAULT 0,
+                    executed_json TEXT,
+                    rejected_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            rows = conn.execute(
+                "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "client_order_id": r["client_order_id"],
+                "symbol": r["symbol"],
+                "side": r["side"],
+                "quantity": r["quantity"],
+                "price": r["price"],
+                "status": r["status"],
+                "message": r["message"] or "",
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def insert_cycle(self, entry: dict) -> int:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_no INTEGER NOT NULL,
+                    message TEXT,
+                    mtm_closed INTEGER DEFAULT 0,
+                    scanned INTEGER DEFAULT 0,
+                    valid_count INTEGER DEFAULT 0,
+                    executed_count INTEGER DEFAULT 0,
+                    rejected_count INTEGER DEFAULT 0,
+                    executed_json TEXT,
+                    rejected_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO cycles(
+                    cycle_no, message, mtm_closed, scanned, valid_count,
+                    executed_count, rejected_count, executed_json, rejected_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    entry.get("cycle_no", 0),
+                    entry.get("message", ""),
+                    entry.get("mtm_closed", 0),
+                    entry.get("scanned", 0),
+                    entry.get("valid_count", 0),
+                    entry.get("executed_count", 0),
+                    entry.get("rejected_count", 0),
+                    json.dumps(entry.get("executed", [])),
+                    json.dumps(entry.get("rejected", [])),
+                    entry.get("created_at") or datetime.utcnow().isoformat() + "Z",
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_cycles(self, limit: int = 50) -> list[dict]:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_no INTEGER NOT NULL,
+                    message TEXT,
+                    mtm_closed INTEGER DEFAULT 0,
+                    scanned INTEGER DEFAULT 0,
+                    valid_count INTEGER DEFAULT 0,
+                    executed_count INTEGER DEFAULT 0,
+                    rejected_count INTEGER DEFAULT 0,
+                    executed_json TEXT,
+                    rejected_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            rows = conn.execute(
+                "SELECT * FROM cycles ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "cycle_no": r["cycle_no"],
+                    "message": r["message"] or "",
+                    "mtm_closed": r["mtm_closed"],
+                    "scanned": r["scanned"],
+                    "valid_count": r["valid_count"],
+                    "executed_count": r["executed_count"],
+                    "rejected_count": r["rejected_count"],
+                    "executed": json.loads(r["executed_json"] or "[]"),
+                    "rejected": json.loads(r["rejected_json"] or "[]"),
+                    "created_at": r["created_at"],
+                }
+            )
+        return out
+
+    def clear_cycles(self) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_no INTEGER NOT NULL,
+                    message TEXT,
+                    mtm_closed INTEGER DEFAULT 0,
+                    scanned INTEGER DEFAULT 0,
+                    valid_count INTEGER DEFAULT 0,
+                    executed_count INTEGER DEFAULT 0,
+                    rejected_count INTEGER DEFAULT 0,
+                    executed_json TEXT,
+                    rejected_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("DELETE FROM cycles")
 
