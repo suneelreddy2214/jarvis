@@ -297,17 +297,20 @@ class FnoSearchService:
         except Exception:
             atr = spot * 0.015
         expiries = list_expiries(sym)
-        fut_px = round(spot * 1.0015, 2)
+        fut_px = round(spot, 2)  # Yahoo spot — no synthetic contango
         return {
             "symbol": sym,
             "exchange": "NSE",
             "spot": spot,
             "change_pct": quote.get("change_pct", 0),
+            "source": quote.get("source", "yahoo_finance"),
+            "yahoo_symbol": quote.get("yahoo_symbol"),
             "futures": {
                 "ltp": fut_px,
-                "basis": round(fut_px - spot, 2),
-                "basis_pct": round((fut_px - spot) / spot * 100, 3),
+                "basis": 0.0,
+                "basis_pct": 0.0,
                 "lot_size": lot_multiplier(TradeType.FUTURES, sym),
+                "note": "Paper futures marked to Yahoo Finance underlying spot",
             },
             "expiries": expiries,
             "default_expiry": expiries[0]["expiry"] if expiries else None,

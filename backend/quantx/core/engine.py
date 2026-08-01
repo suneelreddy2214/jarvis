@@ -33,7 +33,7 @@ from quantx.core.models import (
 )
 from quantx.core.position_sizing import PositionSizer
 from quantx.core.risk import RiskManager
-from quantx.data.market_data import MarketDataService
+from quantx.data.market_data import MarketDataService, YahooFinanceError
 from quantx.portfolio.margin import MARGIN_FRAC, lot_multiplier
 
 logger = logging.getLogger(__name__)
@@ -91,19 +91,40 @@ class QuantXEngine:
             trade_type = strat.trade_type
 
         # Macro gate
-        macro_snap = self.data.get_macro_snapshot()
+        try:
+            macro_snap = self.data.get_macro_snapshot()
+        except YahooFinanceError as e:
+            return self._reject(
+                symbol_clean, exchange, trade_type, 0.0,
+                f"Yahoo Finance macro unavailable: {e}",
+                [], "", "", "",
+            )
         macro = self.macro.analyze(
             nifty_change_pct=macro_snap.get("nifty_change_pct"),
             india_vix=macro_snap.get("india_vix"),
             usdinr_change_pct=macro_snap.get("usdinr_change_pct"),
         )
 
-        df = self.data.get_ohlc(symbol_clean, exchange)
+        try:
+            df = self.data.get_ohlc(symbol_clean, exchange)
+            live_quote = self.data.get_quote(symbol_clean, exchange)
+        except YahooFinanceError as e:
+            return self._reject(
+                symbol_clean, exchange, trade_type, 0.0,
+                f"Yahoo Finance price unavailable: {e}",
+                [], "", "", macro.summary,
+            )
         snap = self.ta.analyze(df)
+        # Prefer live Yahoo regularMarketPrice for decision levels when available
+        yahoo_px = float(live_quote.get("price") or snap.close)
+        if yahoo_px > 0:
+            snap.close = yahoo_px
         info = self.data.get_info(symbol_clean, exchange)
         fund = self.fa.analyze(symbol_clean, info)
         opt = self.oa.analyze(None, spot=snap.close)
         index_sym = is_index(symbol_clean)
+        price_source = live_quote.get("source") or getattr(self.data, "last_source", "yahoo_finance")
+        yahoo_sym = live_quote.get("yahoo_symbol") or ""
 
         # Liquidity check (relaxed for index underlyings used in F&O)
         min_liq = self.settings.risk.min_liquidity_avg_volume
@@ -198,19 +219,23 @@ class QuantXEngine:
         fo_meta = ""
 
         if trade_type == TradeType.FUTURES:
-            fut_px = round(snap.close * 1.0015, 2)  # mild contango paper proxy
+            # Futures paper mark = Yahoo underlying spot (no synthetic basis drift)
+            fut_px = round(float(snap.close), 2)
             fut = self.futures.analyze(snap.close, fut_px, days_to_expiry=30)
-            futures_note = fut.summary
+            futures_note = f"{fut.summary} | Yahoo spot {yahoo_sym or symbol_clean}={fut_px}"
             levels = self.ta.levels_for_trade(snap, side, atr_stop_mult=atr_mult)
-            # Use futures price as entry reference
-            shift = fut_px - snap.close
-            levels = {
-                "entry": round(levels["entry"] + shift, 2),
-                "stop_loss": round(levels["stop_loss"] + shift, 2),
-                "target_1": round(levels["target_1"] + shift, 2),
-                "target_2": round(levels["target_2"] + shift, 2),
-                "risk_reward": levels["risk_reward"],
-            }
+            # Align entry to Yahoo spot (levels already use snap.close)
+            levels["entry"] = fut_px
+            stop_dist = abs(levels["entry"] - levels["stop_loss"])
+            if side == Side.BUY:
+                levels["stop_loss"] = round(levels["entry"] - stop_dist, 2) if stop_dist else levels["stop_loss"]
+                levels["target_1"] = round(levels["entry"] + 2 * stop_dist, 2)
+                levels["target_2"] = round(levels["entry"] + 3 * stop_dist, 2)
+            else:
+                levels["stop_loss"] = round(levels["entry"] + stop_dist, 2) if stop_dist else levels["stop_loss"]
+                levels["target_1"] = round(levels["entry"] - 2 * stop_dist, 2)
+                levels["target_2"] = round(levels["entry"] - 3 * stop_dist, 2)
+            levels["risk_reward"] = 2.0
             mult = lot_multiplier(TradeType.FUTURES, symbol_clean)
             # Ensure ≥1 lot can fit inside 1% risk (index ATR stops are often too wide)
             risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0) * max(risk_scale, 0.01)
@@ -346,6 +371,9 @@ class QuantXEngine:
             risk_notes=(
                 f"Risking ₹{size.capital_at_risk:.0f} ({size.risk_pct:.2f}% of capital). "
                 f"ATR={snap.atr:.2f}. Product={trade_type.value}. "
+                f"Price source={price_source}"
+                + (f" ({yahoo_sym})" if yahoo_sym else "")
+                + ". "
                 + (size.notes or "")
             ),
             alternative_scenario=alt,

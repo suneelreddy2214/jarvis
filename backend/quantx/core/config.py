@@ -55,6 +55,14 @@ class PositionSizingConfig(BaseModel):
     default_atr_period: int = 14
 
 
+class MarketDataConfig(BaseModel):
+    provider: str = "yahoo_finance"
+    yahoo_only: bool = True
+    allow_synthetic: bool = False
+    quote_cache_ttl_sec: float = 60.0
+    ohlc_cache_ttl_sec: float = 300.0
+
+
 class EntryConfig(BaseModel):
     require_trend: bool = True
     require_momentum: bool = True
@@ -87,6 +95,7 @@ class Settings(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     markets: MarketsConfig = Field(default_factory=MarketsConfig)
     position_sizing: PositionSizingConfig = Field(default_factory=PositionSizingConfig)
+    market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     entry: EntryConfig = Field(default_factory=EntryConfig)
     exit: ExitConfig = Field(default_factory=ExitConfig)
     database: dict[str, Any] = Field(default_factory=lambda: {"path": "data/quantx.db"})

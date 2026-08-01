@@ -41,7 +41,20 @@ logger = logging.getLogger("quantx.api")
 
 settings = get_settings()
 db = Database()
-market_data = MarketDataService(use_live=True)
+
+
+def _build_market_data() -> MarketDataService:
+    md = getattr(settings, "market_data", None)
+    return MarketDataService(
+        use_live=True,
+        yahoo_only=bool(getattr(md, "yahoo_only", True)),
+        allow_synthetic=bool(getattr(md, "allow_synthetic", False)),
+        quote_cache_ttl_sec=float(getattr(md, "quote_cache_ttl_sec", 60) or 60),
+        ohlc_cache_ttl_sec=float(getattr(md, "ohlc_cache_ttl_sec", 300) or 300),
+    )
+
+
+market_data = _build_market_data()
 portfolio = PortfolioManager(db=db, market_data=market_data, settings=settings)
 engine = QuantXEngine(settings=settings, risk_manager=portfolio.risk, market_data=market_data)
 broker = PaperBroker(portfolio=portfolio, db=db, settings=settings)
@@ -627,7 +640,8 @@ def broker_status():
     status["agent_mode"] = settings.agent.mode
     status["live_ready"] = all(broker_credentials_present().values())
     status["note"] = (
-        "Paper fills via QuantX PaperBroker + yfinance data. "
+        "Paper fills via QuantX PaperBroker using Yahoo Finance prices only "
+        "(stocks + F&O underlyings). Synthetic prices disabled in paper mode. "
         "Set QUANTX_BROKER_* env vars and mode=live to enable Zerodha Kite."
     )
     return status
@@ -740,7 +754,39 @@ def paper_cycles(limit: int = 50):
 
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str, exchange: str = "NSE"):
-    return market_data.get_quote(symbol, exchange)
+    try:
+        q = market_data.get_quote(symbol, exchange)
+        q["provider"] = "yahoo_finance"
+        return q
+    except Exception as e:
+        raise HTTPException(502, f"Yahoo Finance quote failed: {e}")
+
+
+@app.get("/api/market-data/status")
+def market_data_status():
+    """Confirm paper trading is wired to Yahoo Finance only."""
+    sample = {}
+    err = None
+    try:
+        sample = market_data.get_quote("RELIANCE", "NSE")
+    except Exception as e:
+        err = str(e)
+    return {
+        "ok": err is None,
+        "config": getattr(settings, "market_data", None).model_dump()
+        if getattr(settings, "market_data", None)
+        else {"provider": "yahoo_finance", "yahoo_only": True},
+        "runtime": market_data.provider_status(),
+        "sample_quote": sample,
+        "error": err,
+        "note": "Paper stocks + F&O underlyings use Yahoo Finance only. Synthetic prices disabled.",
+    }
+
+
+@app.post("/api/market-data/clear-cache")
+def market_data_clear_cache():
+    market_data.clear_cache()
+    return {"ok": True, "message": "Yahoo quote/OHLC cache cleared"}
 
 
 @app.get("/api/search")

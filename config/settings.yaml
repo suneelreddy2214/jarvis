@@ -47,6 +47,14 @@ position_sizing:
   atr_multiplier: 2.0
   default_atr_period: 14
 
+# Paper trading market data — Yahoo Finance only (stocks + F&O underlyings)
+market_data:
+  provider: yahoo_finance
+  yahoo_only: true
+  allow_synthetic: false
+  quote_cache_ttl_sec: 60
+  ohlc_cache_ttl_sec: 300
+
 indicators:
   ema_periods: [9, 21, 50, 200]
   sma_periods: [20, 50, 200]
