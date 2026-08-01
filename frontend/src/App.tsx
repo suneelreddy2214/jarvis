@@ -63,6 +63,10 @@ export default function App() {
     expectancy: number
     total_fees: number
   } | null>(null)
+  const [strategy, setStrategy] = useState('swing_trend')
+  const [btSymbol, setBtSymbol] = useState('RELIANCE')
+  const [btResult, setBtResult] = useState<string>('')
+  const [brokerInfo, setBrokerInfo] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -163,6 +167,34 @@ export default function App() {
       setStatus(`Reset failed: ${(err as Error).message}`)
     } finally {
       setBusy(false)
+    }
+  }
+
+  const runBacktest = async () => {
+    setBusy(true)
+    setStatus(`Backtesting ${btSymbol} / ${strategy}…`)
+    try {
+      const r = await api.backtest(btSymbol.trim().toUpperCase(), strategy, '1y')
+      setBtResult(
+        `${r.symbol} · ${r.strategy}\nReturn ${r.total_return_pct.toFixed(2)}% · PnL ${inr(r.total_pnl)}\n` +
+          `Trades ${r.trades} · Win ${r.win_rate.toFixed(1)}% · MaxDD ${r.max_drawdown_pct.toFixed(2)}%\n` +
+          `Expectancy ${inr(r.expectancy)} · Fees ${inr(r.total_fees)}\n` +
+          (r.notes || []).join(' · '),
+      )
+      setStatus(`Backtest done — ${r.symbol} ${r.total_return_pct.toFixed(2)}%`)
+    } catch (err) {
+      setStatus(`Backtest failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const loadBroker = async () => {
+    try {
+      const b = await api.brokerStatus()
+      setBrokerInfo(`${b.name} · ${b.mode} · ${b.message} · live_ready=${b.live_ready}`)
+    } catch (err) {
+      setBrokerInfo((err as Error).message)
     }
   }
 
@@ -622,6 +654,40 @@ export default function App() {
                   </button>
                 ))}
             </div>
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Backtest</h2>
+              <div className="actions">
+                <button className="btn primary" disabled={busy} onClick={runBacktest}>
+                  Run 1Y
+                </button>
+                <button className="btn" onClick={loadBroker}>
+                  Broker
+                </button>
+              </div>
+            </div>
+            <div className="scan-row">
+              <input value={btSymbol} onChange={(e) => setBtSymbol(e.target.value)} placeholder="Symbol" />
+              <select
+                value={strategy}
+                onChange={(e) => setStrategy(e.target.value)}
+                style={{
+                  background: 'var(--bg-0)',
+                  color: 'var(--text)',
+                  border: '1px solid var(--line)',
+                  borderRadius: 8,
+                  padding: '0.55rem 0.75rem',
+                }}
+              >
+                <option value="swing_trend">swing_trend</option>
+                <option value="breakout">breakout</option>
+                <option value="intraday_mean_reversion">intraday_mean_reversion</option>
+              </select>
+            </div>
+            {btResult ? <pre className="report-box">{btResult}</pre> : <p className="empty">Run a 1Y backtest under the same 1% risk rules.</p>}
+            {brokerInfo && <p className="prose">{brokerInfo}</p>}
           </section>
 
           <section className="panel">

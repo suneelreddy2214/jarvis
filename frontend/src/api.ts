@@ -212,6 +212,35 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ confirm }),
     }),
+  strategies: () => req<Array<{ name: string; trade_type: string; class: string }>>('/api/strategies'),
+  backtest: (symbol: string, strategy = 'swing_trend', period = '1y') =>
+    req<{
+      strategy: string
+      symbol: string
+      starting_capital: number
+      ending_capital: number
+      total_pnl: number
+      total_return_pct: number
+      max_drawdown_pct: number
+      trades: number
+      win_rate: number
+      expectancy: number
+      total_fees: number
+      notes: string[]
+    }>('/api/backtest', {
+      method: 'POST',
+      body: JSON.stringify({ symbol, strategy, period, exchange: 'NSE' }),
+    }),
+  brokerStatus: () =>
+    req<{
+      name: string
+      connected: boolean
+      mode: string
+      message: string
+      agent_mode: string
+      live_ready: boolean
+      note: string
+    }>('/api/broker/status'),
 }
 
 export const inr = (n: number) =>

@@ -13,6 +13,7 @@ from quantx.analysis.fundamental import FundamentalAnalyzer
 from quantx.analysis.futures import FuturesAnalyzer
 from quantx.analysis.macro import MacroAnalyzer
 from quantx.analysis.options import OptionsAnalyzer
+from quantx.analysis.strategies import Strategy, get_strategy
 from quantx.analysis.technical import TechnicalAnalyzer
 from quantx.core.config import Settings, get_settings
 from quantx.core.models import (
@@ -37,6 +38,7 @@ class QuantXEngine:
         settings: Optional[Settings] = None,
         risk_manager: Optional[RiskManager] = None,
         market_data: Optional[MarketDataService] = None,
+        strategy: Optional[str | Strategy] = None,
     ):
         self.settings = settings or get_settings()
         self.risk = risk_manager or RiskManager(self.settings)
@@ -47,6 +49,9 @@ class QuantXEngine:
         self.futures = FuturesAnalyzer()
         self.macro = MacroAnalyzer()
         self.sizer = PositionSizer(self.settings)
+        self.strategy: Optional[Strategy] = None
+        if strategy is not None:
+            self.strategy = get_strategy(strategy) if isinstance(strategy, str) else strategy
 
     def analyze_symbol(
         self,
@@ -54,9 +59,17 @@ class QuantXEngine:
         exchange: str = "NSE",
         trade_type: TradeType = TradeType.SWING,
         capital: Optional[float] = None,
+        strategy: Optional[str] = None,
     ) -> TradeRecommendation:
         capital = capital if capital is not None else self.risk.state.capital
         symbol_clean = symbol.upper().replace(".NS", "").replace(".BO", "")
+        strat = None
+        if strategy:
+            strat = get_strategy(strategy)
+        elif self.strategy:
+            strat = self.strategy
+        if strat is not None:
+            trade_type = strat.trade_type
 
         # Macro gate
         macro_snap = self.data.get_macro_snapshot()
@@ -80,23 +93,44 @@ class QuantXEngine:
                 snap.supporting, fund.summary, opt.summary, macro.summary,
             )
 
-        side = self.ta.suggest_side(snap)
-        if side is None:
-            return self._reject(
-                symbol_clean, exchange, trade_type, snap.close,
-                f"No aligned setup — trend={snap.trend.value}, momentum={snap.momentum}",
-                snap.supporting, fund.summary, opt.summary, macro.summary,
-                direction=snap.trend,
-            )
+        side = None
+        strategy_tags: list[str] = []
+        strategy_boost = 0.0
+        strategy_reason = ""
+        if strat is not None:
+            sig = strat.evaluate(snap, df)
+            side = sig.side
+            strategy_tags = sig.tags
+            strategy_boost = sig.confidence_boost
+            strategy_reason = sig.reason
+            if side is None:
+                return self._reject(
+                    symbol_clean, exchange, trade_type, snap.close,
+                    f"Strategy {strat.name} flat — {sig.reason}",
+                    snap.supporting + strategy_tags, fund.summary, opt.summary, macro.summary,
+                    direction=snap.trend,
+                )
+        else:
+            side = self.ta.suggest_side(snap)
+            if side is None:
+                return self._reject(
+                    symbol_clean, exchange, trade_type, snap.close,
+                    f"No aligned setup — trend={snap.trend.value}, momentum={snap.momentum}",
+                    snap.supporting, fund.summary, opt.summary, macro.summary,
+                    direction=snap.trend,
+                )
 
         # Entry gates
         entry_cfg = self.settings.entry
         rejects: list[str] = []
 
         if entry_cfg.require_trend and snap.trend in (MarketDirection.NEUTRAL, MarketDirection.RANGE_BOUND):
-            rejects.append("Trend not confirmed")
+            # Mean-reversion strategies may trade ranges
+            if not (strat and strat.name == "intraday_mean_reversion"):
+                rejects.append("Trend not confirmed")
         if entry_cfg.require_momentum and snap.momentum == "neutral":
-            rejects.append("Momentum not confirmed")
+            if not (strat and strat.name == "intraday_mean_reversion"):
+                rejects.append("Momentum not confirmed")
         if entry_cfg.require_volume and snap.volume_ratio < 1.0:
             rejects.append("Volume not confirmed")
         if fund.score < entry_cfg.min_fundamental_score:
@@ -119,11 +153,16 @@ class QuantXEngine:
             rejects.append(size.notes or "Position size zero")
 
         scores = self._score(snap, fund.score, side, levels["risk_reward"], macro)
+        scores.confidence = round(min(100.0, scores.confidence + strategy_boost), 1)
+        scores.probability_of_success = round(min(100.0, scores.confidence * 0.85), 1)
         if scores.confidence < entry_cfg.min_confidence:
             rejects.append(f"Confidence {scores.confidence:.0f} < {entry_cfg.min_confidence}")
 
         reason = self._build_reason(side, snap, fund, opt, macro)
+        if strategy_reason:
+            reason = f"[{strat.name}] {strategy_reason}. {reason}"
         alt = self._alternative(side, snap)
+        supporting = snap.supporting + ([f"strategy:{t}" for t in strategy_tags] if strategy_tags else [])
 
         rec = TradeRecommendation(
             symbol=symbol_clean,
@@ -140,7 +179,7 @@ class QuantXEngine:
             capital_at_risk=size.capital_at_risk,
             scores=scores,
             reason=reason,
-            supporting_indicators=snap.supporting,
+            supporting_indicators=supporting,
             fundamental_summary=fund.summary,
             options_summary=opt.summary,
             risk_notes=(
@@ -169,11 +208,12 @@ class QuantXEngine:
         symbols: list[str],
         exchange: str = "NSE",
         trade_type: TradeType = TradeType.SWING,
+        strategy: Optional[str] = None,
     ) -> list[TradeRecommendation]:
         results = []
         for sym in symbols:
             try:
-                results.append(self.analyze_symbol(sym, exchange, trade_type))
+                results.append(self.analyze_symbol(sym, exchange, trade_type, strategy=strategy))
             except Exception as e:
                 logger.exception("Scan failed for %s", sym)
                 results.append(

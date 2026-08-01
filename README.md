@@ -90,7 +90,37 @@ QUANTX_BROKER_API_SECRET=
 QUANTX_BROKER_ACCESS_TOKEN=
 ```
 
-## Core modules
+## Next steps built
+
+### Strategies
+- `swing_trend` — EMA stack + SuperTrend + ADX
+- `breakout` — 20-day range break with volume
+- `intraday_mean_reversion` — RSI/BB fades on weak ADX
+
+```bash
+PYTHONPATH=backend python3 -m quantx.cli strategies
+PYTHONPATH=backend python3 -m quantx.cli analyze RELIANCE --strategy swing_trend
+```
+
+### Backtester
+Same risk, sizing, slippage, fees, and exits as paper trading (no look-ahead).
+
+```bash
+PYTHONPATH=backend python3 -m quantx.cli backtest RELIANCE --strategy swing_trend --period 1y
+# or POST /api/backtest
+```
+
+### Broker adapters
+| Mode | Adapter | Data |
+|------|---------|------|
+| **paper** (default) | QuantX `PaperBroker` | Yahoo Finance via `yfinance` |
+| **live** (optional) | Zerodha Kite Connect stub | Requires `QUANTX_BROKER_*` env + `kiteconnect` |
+
+```bash
+PYTHONPATH=backend python3 -m quantx.cli broker
+```
+
+Live trading stays **off** until you set credentials and switch `agent.mode` to `live`.
 
 ```
 backend/quantx/

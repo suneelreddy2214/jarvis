@@ -61,15 +61,26 @@ def main(argv: list[str] | None = None) -> int:
     an = sub.add_parser("analyze", help="Analyze one symbol")
     an.add_argument("symbol")
     an.add_argument("--type", default="SWING", choices=["SWING", "INTRADAY"])
+    an.add_argument("--strategy", default=None)
 
     sc = sub.add_parser("scan", help="Scan comma-separated symbols")
     sc.add_argument("symbols")
     sc.add_argument("--type", default="SWING", choices=["SWING", "INTRADAY"])
+    sc.add_argument("--strategy", default=None)
 
     ex = sub.add_parser("execute", help="Analyze + paper execute one symbol")
     ex.add_argument("symbol")
     ex.add_argument("--type", default="SWING", choices=["SWING", "INTRADAY"])
+    ex.add_argument("--strategy", default=None)
 
+    bt = sub.add_parser("backtest", help="Historical backtest under QuantX risk rules")
+    bt.add_argument("symbol")
+    bt.add_argument("--strategy", default="swing_trend")
+    bt.add_argument("--period", default="1y")
+    bt.add_argument("--capital", type=float, default=None)
+
+    sub.add_parser("strategies", help="List available strategies")
+    sub.add_parser("broker", help="Show broker adapter status")
     sub.add_parser("portfolio", help="Show portfolio snapshot")
     sub.add_parser("performance", help="Show paper performance stats")
 
@@ -106,13 +117,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "analyze":
-        rec = agent.engine.analyze_symbol(args.symbol, trade_type=TradeType(args.type))
+        rec = agent.engine.analyze_symbol(
+            args.symbol, trade_type=TradeType(args.type), strategy=args.strategy
+        )
         _print(rec.model_dump(mode="json"))
         return 0
 
     if args.cmd == "scan":
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        recs = agent.engine.scan_watchlist(symbols, trade_type=TradeType(args.type))
+        recs = agent.engine.scan_watchlist(
+            symbols, trade_type=TradeType(args.type), strategy=args.strategy
+        )
         _print({
             "count": len(recs),
             "valid": sum(1 for r in recs if r.valid),
@@ -121,10 +136,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "execute":
-        rec = agent.engine.analyze_symbol(args.symbol, trade_type=TradeType(args.type))
+        rec = agent.engine.analyze_symbol(
+            args.symbol, trade_type=TradeType(args.type), strategy=args.strategy
+        )
         result = agent.broker.retry_safe(rec)
         result["recommendation"] = rec.model_dump(mode="json")
         _print(result)
+        return 0
+
+    if args.cmd == "backtest":
+        from quantx.analysis.backtest import Backtester
+
+        result = Backtester(settings=agent.settings, market_data=agent.portfolio.data).run(
+            symbol=args.symbol,
+            strategy=args.strategy,
+            period=args.period,
+            capital=args.capital,
+        )
+        out = result.as_dict()
+        # Keep CLI readable — drop full equity curve unless tiny
+        if len(out.get("equity_curve", [])) > 20:
+            out["equity_curve"] = out["equity_curve"][-20:]
+            out["equity_curve_note"] = "trimmed to last 20 points"
+        _print(out)
+        return 0
+
+    if args.cmd == "strategies":
+        from quantx.analysis.strategies import list_strategies
+
+        _print(list_strategies())
+        return 0
+
+    if args.cmd == "broker":
+        from quantx.execution.base import PaperBrokerAdapter, broker_credentials_present
+
+        status = PaperBrokerAdapter(agent.broker).status()
+        status["agent_mode"] = agent.settings.agent.mode
+        status["live_ready"] = all(broker_credentials_present().values())
+        _print(status)
         return 0
 
     if args.cmd == "portfolio":

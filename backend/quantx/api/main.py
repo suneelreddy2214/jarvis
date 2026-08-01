@@ -11,12 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from quantx import __version__
+from quantx.analysis.backtest import Backtester
+from quantx.analysis.strategies import list_strategies
 from quantx.core.config import get_settings
 from quantx.core.emergency import EmergencyController
 from quantx.core.engine import QuantXEngine
 from quantx.core.market_hours import MarketClock
 from quantx.core.models import TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST, MarketDataService
+from quantx.execution.base import PaperBrokerAdapter, broker_credentials_present
 from quantx.execution.broker import PaperBroker
 from quantx.execution.paper_agent import DEFAULT_PAPER_UNIVERSE, get_paper_agent
 from quantx.portfolio.db import Database
@@ -36,6 +39,8 @@ emergency = EmergencyController(portfolio=portfolio, risk=portfolio.risk, db=db)
 reports = ReportGenerator(portfolio=portfolio, engine=engine, data=market_data)
 clock = MarketClock(settings)
 paper_agent = get_paper_agent(portfolio=portfolio, engine=engine, broker=broker, settings=settings)
+paper_adapter = PaperBrokerAdapter(broker)
+backtester = Backtester(settings=settings, market_data=market_data)
 
 
 @asynccontextmanager
@@ -67,18 +72,21 @@ class AnalyzeRequest(BaseModel):
     symbol: str
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
+    strategy: Optional[str] = None
 
 
 class ScanRequest(BaseModel):
     symbols: list[str] = Field(default_factory=lambda: list(DEFAULT_PAPER_UNIVERSE)[:8])
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
+    strategy: Optional[str] = None
 
 
 class ExecuteRequest(BaseModel):
     symbol: str
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
+    strategy: Optional[str] = None
 
 
 class CloseRequest(BaseModel):
@@ -105,6 +113,14 @@ class PaperStartRequest(BaseModel):
 
 class PaperResetRequest(BaseModel):
     confirm: bool = False
+
+
+class BacktestRequest(BaseModel):
+    symbol: str
+    strategy: str = "swing_trend"
+    exchange: str = "NSE"
+    period: str = "1y"
+    capital: Optional[float] = None
 
 
 @app.get("/api/health")
@@ -171,13 +187,13 @@ def close_position(req: CloseRequest):
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
-    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type)
+    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=req.strategy)
     return rec.model_dump(mode="json")
 
 
 @app.post("/api/scan")
 def scan(req: ScanRequest):
-    results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type)
+    results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type, strategy=req.strategy)
     return {
         "count": len(results),
         "valid_count": sum(1 for r in results if r.valid),
@@ -187,10 +203,45 @@ def scan(req: ScanRequest):
 
 @app.post("/api/execute")
 def execute(req: ExecuteRequest):
-    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type)
+    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=req.strategy)
     result = broker.retry_safe(rec)
     result["recommendation"] = rec.model_dump(mode="json")
     return result
+
+
+@app.get("/api/strategies")
+def strategies():
+    return list_strategies()
+
+
+@app.post("/api/backtest")
+def backtest(req: BacktestRequest):
+    try:
+        result = backtester.run(
+            symbol=req.symbol,
+            strategy=req.strategy,
+            exchange=req.exchange,
+            period=req.period,
+            capital=req.capital,
+        )
+        return result.as_dict()
+    except KeyError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("Backtest failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/broker/status")
+def broker_status():
+    status = paper_adapter.status()
+    status["agent_mode"] = settings.agent.mode
+    status["live_ready"] = all(broker_credentials_present().values())
+    status["note"] = (
+        "Paper fills via QuantX PaperBroker + yfinance data. "
+        "Set QUANTX_BROKER_* env vars and mode=live to enable Zerodha Kite."
+    )
+    return status
 
 
 # —— Paper trading session ——
