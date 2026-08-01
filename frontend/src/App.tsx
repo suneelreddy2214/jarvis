@@ -135,29 +135,54 @@ export default function App() {
   const [showLlmSettings, setShowLlmSettings] = useState(false)
 
   const refresh = useCallback(async () => {
-    try {
-      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc, pnl, margin] = await Promise.all([
-        api.portfolio(),
-        api.risk(),
-        api.session(),
-        api.positions(),
-        api.journal(),
-        api.watchlist(),
-        api.emergency(),
-        api.paperStatus(),
-        api.performance(),
-        api.orders(),
-        api.cycles(),
-        api.pnl(),
-        api.margin(),
-      ])
-      setPortfolio(p)
-      setRisk(r)
-      setSession(s)
-      setPositions(pos)
-      setJournal(j)
-      setWatchlist(w)
-      setEmergency(e)
+    const settled = await Promise.allSettled([
+      api.portfolio(),
+      api.risk(),
+      api.session(),
+      api.positions(),
+      api.journal(),
+      api.watchlist(),
+      api.emergency(),
+      api.paperStatus(),
+      api.performance(),
+      api.orders(),
+      api.cycles(),
+      api.pnl(),
+      api.margin(),
+    ])
+    const val = <T,>(i: number): T | null =>
+      settled[i].status === 'fulfilled' ? (settled[i] as PromiseFulfilledResult<T>).value : null
+
+    const p = val<Awaited<ReturnType<typeof api.portfolio>>>(0)
+    const r = val<Awaited<ReturnType<typeof api.risk>>>(1)
+    const s = val<Awaited<ReturnType<typeof api.session>>>(2)
+    const pos = val<Awaited<ReturnType<typeof api.positions>>>(3)
+    const j = val<Awaited<ReturnType<typeof api.journal>>>(4)
+    const w = val<Awaited<ReturnType<typeof api.watchlist>>>(5)
+    const e = val<Awaited<ReturnType<typeof api.emergency>>>(6)
+    const paper = val<Awaited<ReturnType<typeof api.paperStatus>>>(7)
+    const performance = val<Awaited<ReturnType<typeof api.performance>>>(8)
+    const ords = val<Awaited<ReturnType<typeof api.orders>>>(9)
+    const cyc = val<Awaited<ReturnType<typeof api.cycles>>>(10)
+    const pnl = val<Awaited<ReturnType<typeof api.pnl>>>(11)
+    const margin = val<Awaited<ReturnType<typeof api.margin>>>(12)
+
+    const failed = settled
+      .map((x, i) => (x.status === 'rejected' ? i : -1))
+      .filter((i) => i >= 0)
+    if (!p && !r) {
+      const firstErr = settled.find((x) => x.status === 'rejected') as PromiseRejectedResult | undefined
+      setStatus(`Backend offline — start API on :8000 (${firstErr?.reason?.message || 'unreachable'})`)
+      return
+    }
+    if (p) setPortfolio(p)
+    if (r) setRisk(r)
+    if (s) setSession(s)
+    if (pos) setPositions(pos)
+    if (j) setJournal(j)
+    if (w) setWatchlist(w)
+    if (e) setEmergency(e)
+    if (paper) {
       setPaperRunning(paper.session.running)
       setPaperMsg(paper.session.last_message)
       setPaperStats({
@@ -166,33 +191,37 @@ export default function App() {
         rejected: paper.session.rejected,
         valid: paper.session.valid_signals,
       })
-      setPerf(performance)
-      setOrders(ords)
-      setCycles(cyc)
-      setPnlData(pnl)
-      setMarginBook(margin)
-      try {
-        const [reg, stratPack, learn] = await Promise.all([api.regime(), api.strategies(), api.learning()])
-        setRegimeInfo({
-          regime: reg.regime.regime,
-          summary: reg.regime.summary,
-          confidence: reg.regime.confidence,
-        })
-        setStrategyCount(stratPack.count)
-        setLearningTop((learn.leaderboard || []).slice(0, 5))
-      } catch {
-        /* optional */
-      }
-      try {
-        const cfg = await api.llmConfig()
-        setLlmCfg(cfg)
-        setLlmProvider(cfg.provider || 'groq')
-        setLlmModel(cfg.model || '')
-      } catch {
-        /* ignore */
-      }
-    } catch (err) {
-      setStatus(`Backend offline — start API on :8000 (${(err as Error).message})`)
+    }
+    if (performance) setPerf(performance)
+    if (ords) setOrders(ords)
+    if (cyc) setCycles(cyc)
+    if (pnl) setPnlData(pnl)
+    if (margin) setMarginBook(margin)
+
+    try {
+      const [reg, stratPack, learn] = await Promise.all([api.regime(), api.strategies(), api.learning()])
+      setRegimeInfo({
+        regime: reg.regime.regime,
+        summary: reg.regime.summary,
+        confidence: reg.regime.confidence,
+      })
+      setStrategyCount(stratPack.count)
+      setLearningTop((learn.leaderboard || []).slice(0, 5))
+    } catch {
+      /* optional endpoints */
+    }
+    try {
+      const cfg = await api.llmConfig()
+      setLlmCfg(cfg)
+      setLlmProvider(cfg.provider || 'groq')
+      setLlmModel(cfg.model || '')
+    } catch {
+      /* ignore */
+    }
+    if (failed.length && p) {
+      setStatus('QuantX online — some optional endpoints unavailable (restart API if metrics look stale)')
+    } else if (p) {
+      setStatus((prev) => (prev.startsWith('Backend offline') ? 'Ready — paper trading mode' : prev))
     }
   }, [])
 
