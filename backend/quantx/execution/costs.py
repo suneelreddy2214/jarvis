@@ -8,7 +8,7 @@ from typing import Literal
 from quantx.core.models import Side
 
 
-Style = Literal["intraday", "swing"]
+Style = Literal["intraday", "swing", "futures", "options"]
 
 
 @dataclass
@@ -37,8 +37,8 @@ class TradeCosts:
 
 class PaperCostModel:
     """
-    Conservative Indian equity cost model for paper fills.
-    Swing ≈ delivery; intraday ≈ MIS.
+    Conservative Indian market cost model for paper fills.
+    Swing ≈ delivery; intraday ≈ MIS; futures/options ≈ F&O.
     """
 
     def __init__(
@@ -74,10 +74,18 @@ class PaperCostModel:
         )
 
         if style == "intraday":
-            stt = 0.00025 * sell_turnover  # sell side only
+            stt = 0.00025 * sell_turnover
             stamp = 0.00003 * buy_turnover
+        elif style == "futures":
+            stt = 0.0002 * sell_turnover
+            stamp = 0.00002 * buy_turnover
+            brokerage = min(20.0, 0.0003 * buy_turnover) + min(20.0, 0.0003 * sell_turnover)
+        elif style == "options":
+            stt = 0.001 * sell_turnover  # options sell-side STT approx on premium
+            stamp = 0.00003 * buy_turnover
+            brokerage = min(20.0, 0.0003 * buy_turnover) + min(20.0, 0.0003 * sell_turnover)
         else:
-            stt = 0.001 * sell_turnover  # delivery sell
+            stt = 0.001 * sell_turnover
             stamp = 0.00015 * buy_turnover
 
         exchange_txn = 0.0000297 * turnover

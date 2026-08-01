@@ -85,6 +85,13 @@ class Settings(BaseModel):
     database: dict[str, Any] = Field(default_factory=lambda: {"path": "data/quantx.db"})
     indicators: dict[str, Any] = Field(default_factory=dict)
     broker: dict[str, Any] = Field(default_factory=lambda: {"name": "paper"})
+    paper: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "auto_execute": True,
+            "enable_fno": True,
+            "max_fo_positions": 2,
+        }
+    )
     logging: dict[str, Any] = Field(default_factory=dict)
 
     @property

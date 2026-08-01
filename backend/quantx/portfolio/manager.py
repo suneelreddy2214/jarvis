@@ -13,11 +13,13 @@ from quantx.core.models import (
     Side,
     TradeJournalEntry,
     TradeRecommendation,
+    TradeType,
 )
 from quantx.core.risk import RiskManager
 from quantx.data.market_data import MarketDataService
 from quantx.portfolio.db import Database
-from quantx.portfolio.margin import MarginCalculator
+from quantx.portfolio.margin import MarginCalculator, lot_multiplier
+from quantx.analysis.fno import mark_option_premium, parse_fo_meta
 
 
 class PortfolioManager:
@@ -122,12 +124,12 @@ class PortfolioManager:
         if not ok:
             raise ValueError("; ".join(reasons))
 
-        # Never average / pyramid into an existing symbol (paper safety)
+        # Never average / pyramid into an existing symbol+product (paper safety)
         opens = self.db.list_positions("OPEN")
         for p in opens:
-            if p.symbol == rec.symbol:
+            if p.symbol == rec.symbol and p.trade_type == rec.trade_type:
                 raise ValueError(
-                    f"Refusing to add to existing {p.symbol} position "
+                    f"Refusing to add to existing {p.symbol} {p.trade_type.value} position "
                     f"(side={p.side.value}, PnL {p.pnl:.2f}). No averaging."
                 )
 
@@ -155,22 +157,36 @@ class PortfolioManager:
         opens = self.db.list_positions("OPEN")
         updated = []
         for p in opens:
+            mult = lot_multiplier(p.trade_type, p.symbol)
             try:
-                q = self.data.get_quote(p.symbol, p.exchange)
-                price = q["price"]
+                if p.trade_type == TradeType.OPTIONS:
+                    q = self.data.get_quote(p.symbol, p.exchange)
+                    meta = parse_fo_meta(p.reason)
+                    if meta:
+                        price = mark_option_premium(
+                            p.entry_price,
+                            meta["underlying_entry"],
+                            float(q["price"]),
+                            meta["kind"],
+                        )
+                    else:
+                        # Fallback: scale premium with underlying move
+                        price = max(0.05, p.entry_price * (1 + float(q.get("change_pct", 0)) / 200))
+                else:
+                    q = self.data.get_quote(p.symbol, p.exchange)
+                    price = q["price"]
             except Exception:
                 price = p.current_price
             p.current_price = price
             if p.side == Side.BUY:
-                p.pnl = (price - p.entry_price) * p.quantity
+                p.pnl = (price - p.entry_price) * p.quantity * mult
             else:
-                p.pnl = (p.entry_price - price) * p.quantity
-            notional = p.entry_price * p.quantity
+                p.pnl = (p.entry_price - price) * p.quantity * mult
+            notional = p.entry_price * p.quantity * mult
             p.pnl_pct = (p.pnl / notional * 100) if notional else 0
 
             # Trailing stop: ratchet in favor of trade
             if self.settings.exit.use_trailing_stop:
-                # Use 2 ATR approx via 1% of price as fallback trail distance
                 trail_dist = abs(p.entry_price - p.stop_loss) * 0.5
                 if p.side == Side.BUY:
                     candidate = price - trail_dist
@@ -236,8 +252,18 @@ class PortfolioManager:
             else 5.0
         )
         slipped_exit = costs.apply_slippage(exit_price, p.side, is_entry=False)
-        style = "intraday" if p.trade_type.value == "INTRADAY" else "swing"
-        fee = costs.estimate(p.entry_price, slipped_exit, p.quantity, p.side, style)  # type: ignore[arg-type]
+        if p.trade_type == TradeType.FUTURES:
+            style = "futures"
+        elif p.trade_type == TradeType.OPTIONS:
+            style = "options"
+        elif p.trade_type.value == "INTRADAY":
+            style = "intraday"
+        else:
+            style = "swing"
+        mult = lot_multiplier(p.trade_type, p.symbol)
+        fee = costs.estimate(
+            p.entry_price, slipped_exit, p.quantity * mult, p.side, style  # type: ignore[arg-type]
+        )
         exit_fee = fee.total * 0.5  # entry half already charged
 
         p.exit_price = slipped_exit
@@ -246,11 +272,11 @@ class PortfolioManager:
         p.exit_reason = reason
         p.status = PositionStatus.CLOSED
         if p.side == Side.BUY:
-            gross = (slipped_exit - p.entry_price) * p.quantity
+            gross = (slipped_exit - p.entry_price) * p.quantity * mult
         else:
-            gross = (p.entry_price - slipped_exit) * p.quantity
+            gross = (p.entry_price - slipped_exit) * p.quantity * mult
         p.pnl = gross - exit_fee
-        notional = p.entry_price * p.quantity
+        notional = p.entry_price * p.quantity * mult
         p.pnl_pct = (p.pnl / notional * 100) if notional else 0
         self.db.update_position(p)
 

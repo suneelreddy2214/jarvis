@@ -203,20 +203,28 @@ export const api = {
   watchlist: () => req<Quote[]>('/api/watchlist'),
   macro: () => req<Record<string, number>>('/api/macro'),
   emergency: () => req<EmergencyState>('/api/emergency'),
-  analyze: (symbol: string) =>
+  analyze: (symbol: string, trade_type = 'SWING') =>
     req<TradeRecommendation>('/api/analyze', {
       method: 'POST',
-      body: JSON.stringify({ symbol, exchange: 'NSE', trade_type: 'SWING' }),
+      body: JSON.stringify({ symbol, exchange: 'NSE', trade_type }),
     }),
-  scan: (symbols: string[]) =>
-    req<{ count: number; valid_count: number; recommendations: TradeRecommendation[] }>(
+  scan: (symbols: string[], opts: { trade_type?: string; enable_fno?: boolean } = {}) =>
+    req<{ count: number; valid_count: number; recommendations: TradeRecommendation[]; enable_fno?: boolean }>(
       '/api/scan',
-      { method: 'POST', body: JSON.stringify({ symbols, exchange: 'NSE', trade_type: 'SWING' }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          symbols,
+          exchange: 'NSE',
+          trade_type: opts.trade_type || 'SWING',
+          enable_fno: opts.enable_fno ?? false,
+        }),
+      },
     ),
-  execute: (symbol: string) =>
+  execute: (symbol: string, trade_type = 'SWING') =>
     req<{ status: string; message: string; recommendation: TradeRecommendation }>(
       '/api/execute',
-      { method: 'POST', body: JSON.stringify({ symbol, exchange: 'NSE', trade_type: 'SWING' }) },
+      { method: 'POST', body: JSON.stringify({ symbol, exchange: 'NSE', trade_type }) },
     ),
   mark: () => req<{ positions: Position[]; portfolio: PortfolioSnapshot }>('/api/positions/mark', { method: 'POST' }),
   close: (position_id: number, reason = 'Manual close') =>
@@ -263,10 +271,22 @@ export const api = {
       portfolio: PortfolioSnapshot
       risk: RiskStatus
     }>('/api/paper/status'),
-  paperStart: (symbols: string[], interval_sec = 60, auto_execute = true) =>
+  paperStart: (
+    symbols: string[],
+    interval_sec = 60,
+    auto_execute = true,
+    opts: { enable_fno?: boolean; trade_type?: string; trade_types?: string[] } = {},
+  ) =>
     req<Record<string, unknown>>('/api/paper/start', {
       method: 'POST',
-      body: JSON.stringify({ symbols, interval_sec, auto_execute, trade_type: 'SWING' }),
+      body: JSON.stringify({
+        symbols,
+        interval_sec,
+        auto_execute,
+        trade_type: opts.trade_type || 'SWING',
+        enable_fno: opts.enable_fno ?? true,
+        trade_types: opts.trade_types,
+      }),
     }),
   paperStop: () => req<Record<string, unknown>>('/api/paper/stop', { method: 'POST' }),
   paperCycle: () => req<Record<string, unknown>>('/api/paper/cycle', { method: 'POST' }),

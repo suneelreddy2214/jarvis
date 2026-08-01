@@ -65,6 +65,8 @@ export default function App() {
     total_fees: number
   } | null>(null)
   const [strategy, setStrategy] = useState('swing_trend')
+  const [enableFno, setEnableFno] = useState(true)
+  const [scanProduct, setScanProduct] = useState<'ALL' | 'SWING' | 'FUTURES' | 'OPTIONS'>('ALL')
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
@@ -184,8 +186,16 @@ export default function App() {
     setBusy(true)
     try {
       const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
-      await api.paperStart(list, 60, true)
-      setStatus('Paper session STARTED — auto scan/execute under risk gates')
+      await api.paperStart(list, 60, true, {
+        enable_fno: enableFno,
+        trade_type: 'SWING',
+        trade_types: enableFno ? ['SWING', 'FUTURES', 'OPTIONS'] : ['SWING'],
+      })
+      setStatus(
+        enableFno
+          ? 'Paper session STARTED — Stocks + F&O (Futures/Options) under risk gates'
+          : 'Paper session STARTED — equity only under risk gates',
+      )
       await refresh()
     } catch (err) {
       setStatus(`Start failed: ${(err as Error).message}`)
@@ -354,10 +364,15 @@ export default function App() {
 
   const runScan = async () => {
     setBusy(true)
-    setStatus('Scanning watchlist with risk gates…')
+    setStatus(enableFno || scanProduct === 'ALL' ? 'Scanning Stocks + F&O…' : `Scanning ${scanProduct}…`)
     try {
       const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
-      const res = await api.scan(list)
+      const useFno = enableFno || scanProduct === 'ALL'
+      const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
+      const res = await api.scan(list, {
+        enable_fno: useFno,
+        trade_type: useFno ? 'SWING' : product,
+      })
       setRecs(res.recommendations)
       const firstValid = res.recommendations.find((x) => x.valid) || res.recommendations[0] || null
       setSelected(firstValid)
@@ -391,9 +406,9 @@ export default function App() {
   const executeSelected = async () => {
     if (!selected) return
     setBusy(true)
-    setStatus(`Executing ${selected.symbol} (paper)…`)
+    setStatus(`Executing ${selected.symbol} ${selected.trade_type} (paper)…`)
     try {
-      const res = await api.execute(selected.symbol)
+      const res = await api.execute(selected.symbol, selected.trade_type)
       setStatus(`${res.status}: ${res.message}`)
       setSelected(res.recommendation)
       await refresh()
@@ -1204,13 +1219,36 @@ export default function App() {
                 placeholder="NSE symbols, comma-separated"
               />
             </div>
+            <div className="scan-row" style={{ marginTop: '0.5rem', gap: '0.75rem', alignItems: 'center' }}>
+              <label className="chip" style={{ cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={enableFno}
+                  onChange={(e) => setEnableFno(e.target.checked)}
+                  style={{ marginRight: '0.4rem' }}
+                />
+                Include F&amp;O (Futures + Options)
+              </label>
+              <select
+                value={scanProduct}
+                onChange={(e) => setScanProduct(e.target.value as typeof scanProduct)}
+                disabled={enableFno}
+                aria-label="Product"
+              >
+                <option value="ALL">All products</option>
+                <option value="SWING">Stocks only</option>
+                <option value="FUTURES">Futures only</option>
+                <option value="OPTIONS">Options only</option>
+              </select>
+            </div>
             {recs.length === 0 ? (
-              <p className="empty">Run a scan to generate recommendations with confidence & risk scores.</p>
+              <p className="empty">Run a scan to generate Stocks and F&amp;O recommendations with confidence &amp; risk scores.</p>
             ) : (
               <table className="table">
                 <thead>
                   <tr>
                     <th>Symbol</th>
+                    <th>Product</th>
                     <th>Side</th>
                     <th>Conf</th>
                     <th>RR</th>
@@ -1220,11 +1258,20 @@ export default function App() {
                 <tbody>
                   {recs.map((r) => (
                     <tr
-                      key={r.symbol + r.generated_at}
+                      key={`${r.symbol}-${r.trade_type}-${r.generated_at}`}
                       onClick={() => setSelected(r)}
-                      style={{ cursor: 'pointer', outline: selected?.symbol === r.symbol ? '1px solid rgba(62,207,172,0.35)' : undefined }}
+                      style={{
+                        cursor: 'pointer',
+                        outline:
+                          selected?.symbol === r.symbol && selected?.trade_type === r.trade_type
+                            ? '1px solid rgba(62,207,172,0.35)'
+                            : undefined,
+                      }}
                     >
                       <td>{r.symbol}</td>
+                      <td>
+                        <span className="pill valid">{r.trade_type}</span>
+                      </td>
                       <td>
                         <span className={`pill ${r.side === 'BUY' ? 'buy' : 'sell'}`}>{r.side}</span>
                       </td>
@@ -1251,6 +1298,10 @@ export default function App() {
             ) : (
               <div className="rec-detail">
                 <div className="rec-grid">
+                  <div className="rec-cell">
+                    <span>Product</span>
+                    <strong>{selected.trade_type}</strong>
+                  </div>
                   <div className="rec-cell">
                     <span>Direction</span>
                     <strong>{selected.market_direction}</strong>
@@ -1360,6 +1411,16 @@ export default function App() {
                 <strong className="warn">{paperStats.rejected}</strong>
               </div>
             </div>
+            <label className="chip" style={{ display: 'inline-flex', marginTop: '0.75rem', cursor: paperRunning ? 'not-allowed' : 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={enableFno}
+                disabled={paperRunning}
+                onChange={(e) => setEnableFno(e.target.checked)}
+                style={{ marginRight: '0.4rem' }}
+              />
+              Auto-trade F&amp;O with Stocks
+            </label>
             <p className="prose" style={{ marginTop: '0.75rem' }}>
               <strong>Last cycle.</strong> {paperMsg}
             </p>
@@ -1388,6 +1449,7 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Sym</th>
+                    <th>Product</th>
                     <th>Side</th>
                     <th>PnL</th>
                     <th></th>
@@ -1401,6 +1463,9 @@ export default function App() {
                         <div style={{ color: 'var(--muted)', fontSize: '0.7rem' }}>
                           {p.quantity} @ {p.entry_price.toFixed(1)}
                         </div>
+                      </td>
+                      <td>
+                        <span className="pill valid">{p.trade_type || 'SWING'}</span>
                       </td>
                       <td>
                         <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>

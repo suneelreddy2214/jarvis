@@ -131,10 +131,95 @@ class BreakoutStrategy(Strategy):
         return StrategySignal(side=side, trade_type=self.trade_type, confidence_boost=boost, reason=reason, tags=tags)
 
 
+class FuturesTrendStrategy(Strategy):
+    """Index / stock futures continuation on EMA + SuperTrend."""
+
+    name = "futures_trend"
+    trade_type = TradeType.FUTURES
+
+    def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
+        tags: list[str] = []
+        boost = 0.0
+        side: Optional[Side] = None
+
+        if snap.trend == MarketDirection.BULLISH and snap.momentum in ("up", "strong_up"):
+            if snap.ema_9 > snap.ema_21 and snap.supertrend_dir == 1:
+                side = Side.BUY
+                tags += ["fut_long", "ema_supertrend"]
+                boost += 6
+        elif snap.trend == MarketDirection.BEARISH and snap.momentum in ("down", "strong_down"):
+            if snap.ema_9 < snap.ema_21 and snap.supertrend_dir == -1:
+                side = Side.SELL
+                tags += ["fut_short", "ema_supertrend"]
+                boost += 6
+        # Softer fallback: clear trend + ADX without full EMA stack
+        if side is None and snap.adx >= 22:
+            if snap.trend == MarketDirection.BULLISH and snap.supertrend_dir == 1:
+                side = Side.BUY
+                tags += ["fut_long", "adx_trend"]
+                boost += 4
+            elif snap.trend == MarketDirection.BEARISH and snap.supertrend_dir == -1:
+                side = Side.SELL
+                tags += ["fut_short", "adx_trend"]
+                boost += 4
+
+        if snap.volume_ratio >= 1.1:
+            tags.append("volume")
+            boost += 2
+
+        reason = (
+            f"FuturesTrend {side.value if side else 'FLAT'}: "
+            f"trend={snap.trend.value} mom={snap.momentum} adx={snap.adx:.1f}"
+        )
+        return StrategySignal(
+            side=side, trade_type=self.trade_type, confidence_boost=boost, reason=reason, tags=tags
+        )
+
+
+class OptionsDirectionalStrategy(Strategy):
+    """Buy CE on bullish trend / Buy PE on bearish — long premium only."""
+
+    name = "options_directional"
+    trade_type = TradeType.OPTIONS
+
+    def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
+        tags: list[str] = []
+        boost = 0.0
+        side: Optional[Side] = None
+
+        if snap.trend == MarketDirection.BULLISH and snap.momentum in ("up", "strong_up", "neutral"):
+            if snap.supertrend_dir == 1 and snap.ema_9 >= snap.ema_21 * 0.998:
+                side = Side.BUY  # long CE (encoded in engine)
+                tags += ["long_ce", "trend_up"]
+                boost += 6
+        elif snap.trend == MarketDirection.BEARISH and snap.momentum in ("down", "strong_down", "neutral"):
+            if snap.supertrend_dir == -1 and snap.ema_9 <= snap.ema_21 * 1.002:
+                side = Side.SELL  # signals PE buy; engine converts to BUY option
+                tags += ["long_pe", "trend_down"]
+                boost += 6
+
+        if snap.adx >= 20:
+            tags.append("adx_ok")
+            boost += 3
+        if snap.volume_ratio >= 1.05:
+            tags.append("volume")
+            boost += 2
+
+        reason = (
+            f"OptionsDirectional {side.value if side else 'FLAT'}: "
+            f"trend={snap.trend.value} mom={snap.momentum}"
+        )
+        return StrategySignal(
+            side=side, trade_type=self.trade_type, confidence_boost=boost, reason=reason, tags=tags
+        )
+
+
 STRATEGIES: dict[str, Strategy] = {
     "swing_trend": SwingTrendStrategy(),
     "intraday_mean_reversion": IntradayMeanReversionStrategy(),
     "breakout": BreakoutStrategy(),
+    "futures_trend": FuturesTrendStrategy(),
+    "options_directional": OptionsDirectionalStrategy(),
 }
 
 

@@ -38,10 +38,13 @@ class PositionSizer:
         lot_size: int = 1,
         max_quantity: Optional[int] = None,
         broker_margin_pct: float = 100.0,
+        quantity_as_lots: bool = False,
     ) -> PositionSizeResult:
         """
         Calculate position size so that loss at stop ≈ risk_per_trade_pct of capital.
-        Never exceeds 1% risk (configurable).
+
+        When quantity_as_lots=True (F&O), quantity is number of lots and
+        lot_size is the contract multiplier (e.g. NIFTY=25).
         """
         risk_pct = self.settings.risk.max_risk_per_trade_pct
         risk_amount = capital * (risk_pct / 100.0)
@@ -57,28 +60,43 @@ class PositionSizer:
                 notes="Invalid stop distance — trade rejected",
             )
 
-        # ATR-aware: ensure stop is at least atr_multiplier * ATR away when ATR provided
         method = self.settings.position_sizing.method
         notes = ""
-        if method == "atr" and atr and atr > 0:
+        if method == "atr" and atr and atr > 0 and not quantity_as_lots:
             min_stop = atr * self.settings.position_sizing.atr_multiplier
             if stop_distance < min_stop * 0.5:
                 notes = f"Stop unusually tight vs ATR({atr:.2f}); size reduced for safety"
-                # Use wider effective stop for sizing to avoid oversized positions
                 stop_distance = max(stop_distance, min_stop * 0.5)
 
-        raw_qty = risk_amount / stop_distance
-        quantity = int(raw_qty // lot_size) * lot_size
+        mult = max(1, int(lot_size))
 
-        # Margin constraint (for futures/options leverage)
-        if broker_margin_pct < 100 and entry > 0:
-            max_by_margin = int((capital * (broker_margin_pct / 100)) / (entry * lot_size)) * lot_size
-            if max_by_margin < quantity:
-                quantity = max(0, max_by_margin)
-                notes = (notes + "; " if notes else "") + "Capped by broker margin"
+        if quantity_as_lots:
+            risk_per_lot = stop_distance * mult
+            quantity = int(risk_amount // risk_per_lot) if risk_per_lot > 0 else 0
+            if entry > 0 and broker_margin_pct > 0:
+                # broker_margin_pct is % of notional blocked (12 for futures, 100 for long options)
+                frac = broker_margin_pct / 100.0
+                max_notional = capital / frac if frac > 0 else 0.0
+                max_lots = int(max_notional // (entry * mult)) if entry * mult > 0 else 0
+                if max_lots < quantity:
+                    quantity = max(0, max_lots)
+                    notes = (notes + "; " if notes else "") + "Capped by F&O margin"
+            if max_quantity is not None:
+                quantity = min(quantity, max_quantity)
+            capital_at_risk = quantity * risk_per_lot
+        else:
+            raw_qty = risk_amount / stop_distance
+            quantity = int(raw_qty // mult) * mult
 
-        if max_quantity is not None:
-            quantity = min(quantity, max_quantity)
+            if broker_margin_pct < 100 and entry > 0:
+                max_by_margin = int((capital * (broker_margin_pct / 100)) / (entry * mult)) * mult
+                if max_by_margin < quantity:
+                    quantity = max(0, max_by_margin)
+                    notes = (notes + "; " if notes else "") + "Capped by broker margin"
+
+            if max_quantity is not None:
+                quantity = min(quantity, max_quantity)
+            capital_at_risk = quantity * stop_distance
 
         if quantity <= 0:
             return PositionSizeResult(
@@ -90,13 +108,16 @@ class PositionSizer:
                 notes=notes or "Quantity rounds to zero — skip trade",
             )
 
-        capital_at_risk = quantity * stop_distance
         actual_risk_pct = (capital_at_risk / capital * 100) if capital else 0.0
 
-        # Hard cap: never exceed configured risk %
         if actual_risk_pct > risk_pct + 0.01:
-            quantity = int((risk_amount / stop_distance) // lot_size) * lot_size
-            capital_at_risk = quantity * stop_distance
+            if quantity_as_lots:
+                risk_per_lot = stop_distance * mult
+                quantity = int(risk_amount // risk_per_lot) if risk_per_lot > 0 else 0
+                capital_at_risk = quantity * risk_per_lot
+            else:
+                quantity = int((risk_amount / stop_distance) // mult) * mult
+                capital_at_risk = quantity * stop_distance
             actual_risk_pct = (capital_at_risk / capital * 100) if capital else 0.0
 
         return PositionSizeResult(

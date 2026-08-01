@@ -33,6 +33,15 @@ def to_yahoo_symbol(symbol: str, exchange: str = "NSE") -> str:
     s = symbol.strip().upper()
     if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
         return s
+    # Index aliases used by F&O paper book
+    index_map = {
+        "NIFTY": "^NSEI",
+        "NIFTY50": "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "INDIAVIX": "^INDIAVIX",
+    }
+    if s in index_map:
+        return index_map[s]
     if exchange.upper() == "BSE":
         return f"{s}.BO"
     return f"{s}.NS"
@@ -147,8 +156,10 @@ class MarketDataService:
             base = 3500
         elif "HDFC" in symbol or "ICICI" in symbol:
             base = 1600
-        elif "NSEI" in symbol:
+        elif "NSEI" in symbol or symbol in ("NIFTY", "NIFTY50"):
             base = 24000
+        elif "NSEBANK" in symbol or "BANKNIFTY" in symbol:
+            base = 52000
         elif "VIX" in symbol:
             base = 14.0
 
@@ -161,6 +172,8 @@ class MarketDataService:
         volume = rng.integers(200_000, 2_000_000, bars).astype(float)
         if "VIX" in symbol:
             volume = rng.integers(1_000, 50_000, bars).astype(float)
+        if "NSEI" in symbol or "NSEBANK" in symbol:
+            volume = rng.integers(150_000, 800_000, bars).astype(float)
 
         df = pd.DataFrame(
             {"open": open_, "high": high, "low": low, "close": close, "volume": volume},

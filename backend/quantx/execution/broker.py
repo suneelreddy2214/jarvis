@@ -3,22 +3,21 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from typing import Optional
 
+from quantx.analysis.fno import mark_option_premium, parse_fo_meta
 from quantx.core.config import Settings, get_settings
 from quantx.core.market_hours import MarketClock
-from quantx.core.models import OrderStatus, Side, TradeRecommendation, TradeType
+from quantx.core.models import OrderStatus, Position, Side, TradeRecommendation, TradeType
 from quantx.execution.costs import PaperCostModel
 from quantx.portfolio.db import Database
 from quantx.portfolio.manager import PortfolioManager
-
-logger = logging.getLogger(__name__)
+from quantx.portfolio.margin import MarginCalculator, lot_multiplier
 
 
 class PaperBroker:
     """
-    Realistic paper execution for NSE equities.
+    Realistic paper execution for NSE equities and F&O.
     Applies adverse slippage + round-trip cost estimate on open (reserved) / close.
     """
 
@@ -39,16 +38,54 @@ class PaperBroker:
         else:
             slip = 5.0
         self.costs = cost_model or PaperCostModel(slippage_bps=slip)
+        self.margin = MarginCalculator()
 
     def _client_order_id(self, rec: TradeRecommendation) -> str:
         raw = (
-            f"{rec.symbol}|{rec.side.value}|{round(rec.entry,2)}|"
+            f"{rec.symbol}|{rec.trade_type.value}|{rec.side.value}|{round(rec.entry,2)}|"
             f"{round(rec.stop_loss,2)}|{rec.quantity}|{rec.generated_at.date()}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def _style(self, trade_type: TradeType) -> str:
-        return "intraday" if trade_type == TradeType.INTRADAY else "swing"
+        if trade_type == TradeType.INTRADAY:
+            return "intraday"
+        if trade_type == TradeType.FUTURES:
+            return "futures"
+        if trade_type == TradeType.OPTIONS:
+            return "options"
+        return "swing"
+
+    def _fill_price(self, rec: TradeRecommendation) -> tuple[float | None, str | None]:
+        """Return (fill_price, error_message)."""
+        if rec.trade_type == TradeType.OPTIONS:
+            # Options: fill near recommended premium (spot quote is underlying)
+            try:
+                quote = self.portfolio.data.get_quote(rec.symbol, rec.exchange)
+                meta = parse_fo_meta(rec.reason)
+                if meta:
+                    last = mark_option_premium(
+                        rec.entry, meta["underlying_entry"], float(quote["price"]), meta["kind"]
+                    )
+                else:
+                    last = rec.entry
+            except Exception:
+                last = rec.entry
+            return self.costs.apply_slippage(last, rec.side, is_entry=True), None
+
+        try:
+            quote = self.portfolio.data.get_quote(rec.symbol, rec.exchange)
+            last = float(quote["price"])
+        except Exception as e:
+            return None, f"Quote unavailable: {e}"
+
+        if rec.entry > 0:
+            drift = abs(last - rec.entry) / rec.entry
+            # Futures can drift slightly vs spot-based recommendation
+            limit = 0.04 if rec.trade_type == TradeType.FUTURES else 0.03
+            if drift > limit:
+                return None, f"Price drift {drift*100:.1f}% vs recommendation — refresh analysis"
+        return self.costs.apply_slippage(last, rec.side, is_entry=True), None
 
     def execute(self, rec: TradeRecommendation) -> dict:
         # Hard lock: paper mode only in this broker
@@ -80,37 +117,23 @@ class PaperBroker:
                 "position": None,
             }
 
-        # Quote + slippage fill
-        try:
-            quote = self.portfolio.data.get_quote(rec.symbol, rec.exchange)
-            last = float(quote["price"])
-        except Exception as e:
+        fill_price, err = self._fill_price(rec)
+        if err or fill_price is None:
             return {
                 "status": OrderStatus.REJECTED.value,
-                "message": f"Quote unavailable: {e}",
+                "message": err or "Fill unavailable",
                 "position": None,
             }
 
-        if rec.entry > 0:
-            drift = abs(last - rec.entry) / rec.entry
-            if drift > 0.03:
-                return {
-                    "status": OrderStatus.REJECTED.value,
-                    "message": f"Price drift {drift*100:.1f}% vs recommendation — refresh analysis",
-                    "position": None,
-                }
-
-        fill_price = self.costs.apply_slippage(last, rec.side, is_entry=True)
-
-        # Recompute capital at risk with slipped entry (stop unchanged)
+        mult = lot_multiplier(rec.trade_type, rec.symbol)
         stop_dist = abs(fill_price - rec.stop_loss)
-        capital_at_risk = stop_dist * rec.quantity
+        capital_at_risk = stop_dist * rec.quantity * mult
         max_risk = self.portfolio.risk.state.capital * (
             self.settings.risk.max_risk_per_trade_pct / 100
         )
         if capital_at_risk > max_risk + 1:
-            # shrink qty to fit risk
-            qty = int(max_risk // stop_dist) if stop_dist > 0 else 0
+            risk_per_lot = stop_dist * mult
+            qty = int(max_risk // risk_per_lot) if risk_per_lot > 0 else 0
             if qty <= 0:
                 return {
                     "status": OrderStatus.REJECTED.value,
@@ -118,26 +141,40 @@ class PaperBroker:
                     "position": None,
                 }
             rec.quantity = qty
-            capital_at_risk = stop_dist * qty
+            capital_at_risk = stop_dist * qty * mult
 
-        # Est. round-trip costs using stop as worst-case exit proxy for margin buffer
         style = self._style(rec.trade_type)
         est = self.costs.estimate(
             entry=fill_price,
             exit=rec.stop_loss,
-            quantity=rec.quantity,
+            quantity=rec.quantity * mult,
             side=rec.side,
             style=style,  # type: ignore[arg-type]
         )
 
+        # Margin check via MarginCalculator
+        temp = Position(
+            symbol=rec.symbol,
+            exchange=rec.exchange,
+            side=rec.side,
+            trade_type=rec.trade_type,
+            quantity=rec.quantity,
+            entry_price=fill_price,
+            current_price=fill_price,
+            stop_loss=rec.stop_loss,
+            target_1=rec.target_1,
+            target_2=rec.target_2,
+            capital_at_risk=capital_at_risk,
+        )
+        pm = self.margin.margin_for_position(temp)
         snap = self.portfolio.snapshot()
-        required = capital_at_risk + fill_price * rec.quantity * 0.05 + est.total
+        required = pm.margin_required + est.total * 0.5
         if required > snap.available_margin:
             return {
                 "status": OrderStatus.REJECTED.value,
                 "message": (
-                    f"Insufficient margin: need ~₹{required:,.0f}, "
-                    f"available ₹{snap.available_margin:,.0f}"
+                    f"Insufficient margin: need ~₹{required:,.0f} "
+                    f"({rec.trade_type.value}), available ₹{snap.available_margin:,.0f}"
                 ),
                 "position": None,
             }
@@ -149,7 +186,6 @@ class PaperBroker:
         if rec.side == Side.BUY:
             risk_amt = fill_price - rec.stop_loss
             if risk_amt > 0:
-                # Preserve policy RR after adverse slip (stop fixed, target nudged)
                 if (rec.target_1 - fill_price) / risk_amt < min_rr:
                     rec.target_1 = round(fill_price + min_rr * risk_amt, 2)
                     rec.target_2 = round(fill_price + (min_rr + 1) * risk_amt, 2)
@@ -172,21 +208,20 @@ class PaperBroker:
             }
 
         try:
-            # Record only after successful open to avoid blocking retries on transient fails
             position = self.portfolio.open_from_recommendation(rec)
             entry_fee = est.total * 0.5
             if entry_fee > 0:
-                self.portfolio.charge_fees(entry_fee, note=f"entry costs {rec.symbol}")
+                self.portfolio.charge_fees(entry_fee, note=f"entry costs {rec.symbol} {rec.trade_type.value}")
             self.db.record_order(
                 coid, rec.symbol, rec.side.value, rec.quantity, fill_price,
                 OrderStatus.FILLED.value,
-                f"filled pos#{position.id} slip={self.costs.slippage_bps}bps fee≈{entry_fee:.2f}",
+                f"filled pos#{position.id} {rec.trade_type.value} slip={self.costs.slippage_bps}bps fee≈{entry_fee:.2f}",
             )
             return {
                 "status": OrderStatus.FILLED.value,
                 "message": (
-                    f"Paper fill @ ₹{fill_price:.2f} "
-                    f"(slip {self.costs.slippage_bps} bps, entry costs ₹{entry_fee:.2f})"
+                    f"Paper {rec.trade_type.value} fill @ ₹{fill_price:.2f} "
+                    f"x{rec.quantity} lot(s) (slip {self.costs.slippage_bps} bps, entry costs ₹{entry_fee:.2f})"
                 ),
                 "client_order_id": coid,
                 "fill_price": fill_price,

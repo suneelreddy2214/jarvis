@@ -11,6 +11,13 @@ from typing import Optional
 
 from quantx.analysis.fundamental import FundamentalAnalyzer
 from quantx.analysis.futures import FuturesAnalyzer
+from quantx.analysis.fno import (
+    encode_fo_meta,
+    is_index,
+    option_kind_for_side,
+    paper_option_levels,
+    paper_option_premium,
+)
 from quantx.analysis.macro import MacroAnalyzer
 from quantx.analysis.options import OptionsAnalyzer
 from quantx.analysis.strategies import Strategy, get_strategy
@@ -26,6 +33,7 @@ from quantx.core.models import (
 from quantx.core.position_sizing import PositionSizer
 from quantx.core.risk import RiskManager
 from quantx.data.market_data import MarketDataService
+from quantx.portfolio.margin import MARGIN_FRAC, lot_multiplier
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +92,22 @@ class QuantXEngine:
         info = self.data.get_info(symbol_clean, exchange)
         fund = self.fa.analyze(symbol_clean, info)
         opt = self.oa.analyze(None, spot=snap.close)
+        index_sym = is_index(symbol_clean)
 
-        # Liquidity check
-        if snap.avg_volume < self.settings.risk.min_liquidity_avg_volume:
+        # Liquidity check (relaxed for index underlyings used in F&O)
+        min_liq = self.settings.risk.min_liquidity_avg_volume
+        if index_sym:
+            min_liq = min(min_liq, 50_000)
+        if snap.avg_volume < min_liq and trade_type not in (TradeType.FUTURES, TradeType.OPTIONS):
             return self._reject(
                 symbol_clean, exchange, trade_type, snap.close,
-                f"Low liquidity: avg volume {snap.avg_volume:.0f} < {self.settings.risk.min_liquidity_avg_volume}",
+                f"Low liquidity: avg volume {snap.avg_volume:.0f} < {min_liq}",
+                snap.supporting, fund.summary, opt.summary, macro.summary,
+            )
+        if snap.avg_volume < min_liq and trade_type in (TradeType.FUTURES, TradeType.OPTIONS) and not index_sym:
+            return self._reject(
+                symbol_clean, exchange, trade_type, snap.close,
+                f"Low liquidity for stock F&O: avg volume {snap.avg_volume:.0f} < {min_liq}",
                 snap.supporting, fund.summary, opt.summary, macro.summary,
             )
 
@@ -125,43 +143,134 @@ class QuantXEngine:
         rejects: list[str] = []
 
         if entry_cfg.require_trend and snap.trend in (MarketDirection.NEUTRAL, MarketDirection.RANGE_BOUND):
-            # Mean-reversion strategies may trade ranges
             if not (strat and strat.name == "intraday_mean_reversion"):
                 rejects.append("Trend not confirmed")
         if entry_cfg.require_momentum and snap.momentum == "neutral":
             if not (strat and strat.name == "intraday_mean_reversion"):
                 rejects.append("Momentum not confirmed")
-        if entry_cfg.require_volume and snap.volume_ratio < 1.0:
+        if entry_cfg.require_volume and snap.volume_ratio < 1.0 and not index_sym:
             rejects.append("Volume not confirmed")
-        if fund.score < entry_cfg.min_fundamental_score:
-            rejects.append(f"Fundamental score {fund.score:.0f} < {entry_cfg.min_fundamental_score}")
+        # Fundamentals: skip / relax for index F&O
+        if not index_sym and fund.score < entry_cfg.min_fundamental_score:
+            if trade_type not in (TradeType.FUTURES, TradeType.OPTIONS):
+                rejects.append(f"Fundamental score {fund.score:.0f} < {entry_cfg.min_fundamental_score}")
+            elif fund.score < entry_cfg.min_fundamental_score - 15:
+                rejects.append(f"Fundamental score {fund.score:.0f} too weak for stock F&O")
         if macro.avoid_new_risk and entry_cfg.avoid_major_news:
             rejects.append(f"Macro risk elevated: {macro.summary}")
 
-        levels = self.ta.levels_for_trade(snap, side)
+        # --- Product-specific levels & sizing ---
+        futures_note = ""
+        options_note = opt.summary
+        order_side = side
+        fo_meta = ""
+
+        if trade_type == TradeType.FUTURES:
+            fut_px = round(snap.close * 1.0015, 2)  # mild contango paper proxy
+            fut = self.futures.analyze(snap.close, fut_px, days_to_expiry=30)
+            futures_note = fut.summary
+            levels = self.ta.levels_for_trade(snap, side)
+            # Use futures price as entry reference
+            shift = fut_px - snap.close
+            levels = {
+                "entry": round(levels["entry"] + shift, 2),
+                "stop_loss": round(levels["stop_loss"] + shift, 2),
+                "target_1": round(levels["target_1"] + shift, 2),
+                "target_2": round(levels["target_2"] + shift, 2),
+                "risk_reward": levels["risk_reward"],
+            }
+            mult = lot_multiplier(TradeType.FUTURES, symbol_clean)
+            # Ensure ≥1 lot can fit inside 1% risk (index ATR stops are often too wide)
+            risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0)
+            max_stop = risk_budget / mult if mult else levels["entry"]
+            stop_dist = abs(levels["entry"] - levels["stop_loss"])
+            if stop_dist > max_stop > 0:
+                if side == Side.BUY:
+                    levels["stop_loss"] = round(levels["entry"] - max_stop, 2)
+                    levels["target_1"] = round(levels["entry"] + 2 * max_stop, 2)
+                    levels["target_2"] = round(levels["entry"] + 3 * max_stop, 2)
+                else:
+                    levels["stop_loss"] = round(levels["entry"] + max_stop, 2)
+                    levels["target_1"] = round(levels["entry"] - 2 * max_stop, 2)
+                    levels["target_2"] = round(levels["entry"] - 3 * max_stop, 2)
+                levels["risk_reward"] = 2.0
+            size = self.sizer.calculate(
+                capital=capital,
+                entry=levels["entry"],
+                stop_loss=levels["stop_loss"],
+                side=side,
+                atr=None,
+                lot_size=mult,
+                broker_margin_pct=MARGIN_FRAC["FUTURES"] * 100,
+                quantity_as_lots=True,
+            )
+            strategy_tags = strategy_tags + ["futures", f"lot={mult}"]
+            reason_prefix = f"FUTURES ({mult} mult). {futures_note}. "
+
+        elif trade_type == TradeType.OPTIONS:
+            # Directional long premium only (CE on bullish, PE on bearish)
+            kind = option_kind_for_side(side)
+            premium = paper_option_premium(snap.close, snap.atr)
+            levels = paper_option_levels(premium)
+            strike = round(snap.close / 50) * 50
+            if symbol_clean.upper() == "BANKNIFTY":
+                strike = round(snap.close / 100) * 100
+            fo_meta = encode_fo_meta(snap.close, kind, float(strike))
+            options_note = (
+                f"Paper {kind} @ strike {strike:.0f}, premium ₹{premium:.2f} (ATM proxy). "
+                f"{opt.summary}"
+            )
+            order_side = Side.BUY  # always long options in v1
+            mult = lot_multiplier(TradeType.OPTIONS, symbol_clean)
+            # Cap premium stop so 1 lot fits 1% risk
+            risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0)
+            max_prem_stop = risk_budget / mult if mult else levels["entry"] * 0.5
+            if (levels["entry"] - levels["stop_loss"]) > max_prem_stop > 0:
+                levels["stop_loss"] = round(max(levels["entry"] - max_prem_stop, 0.5), 2)
+                risk = levels["entry"] - levels["stop_loss"]
+                levels["target_1"] = round(levels["entry"] + 2 * risk, 2)
+                levels["target_2"] = round(levels["entry"] + 3 * risk, 2)
+                levels["risk_reward"] = 2.0
+            size = self.sizer.calculate(
+                capital=capital,
+                entry=levels["entry"],
+                stop_loss=levels["stop_loss"],
+                side=order_side,
+                atr=None,  # do not widen option premium stops via ATR
+                lot_size=mult,
+                broker_margin_pct=MARGIN_FRAC["OPTIONS_BUY"] * 100,
+                quantity_as_lots=True,
+            )
+            strategy_tags = strategy_tags + ["options", kind, f"lot={mult}"]
+            reason_prefix = f"OPTIONS long {kind}. {fo_meta} "
+
+        else:
+            levels = self.ta.levels_for_trade(snap, side)
+            size = self.sizer.calculate(
+                capital=capital,
+                entry=levels["entry"],
+                stop_loss=levels["stop_loss"],
+                side=side,
+                atr=snap.atr,
+            )
+            reason_prefix = ""
+
         if levels["risk_reward"] < self.settings.risk.min_risk_reward:
             rejects.append(f"RR {levels['risk_reward']:.2f} < {self.settings.risk.min_risk_reward}")
 
-        size = self.sizer.calculate(
-            capital=capital,
-            entry=levels["entry"],
-            stop_loss=levels["stop_loss"],
-            side=side,
-            atr=snap.atr,
-        )
         if size.quantity <= 0:
             rejects.append(size.notes or "Position size zero")
 
-        scores = self._score(snap, fund.score, side, levels["risk_reward"], macro)
+        scores = self._score(snap, fund.score if not index_sym else max(fund.score, 60), order_side, levels["risk_reward"], macro)
         scores.confidence = round(min(100.0, scores.confidence + strategy_boost), 1)
         scores.probability_of_success = round(min(100.0, scores.confidence * 0.85), 1)
         if scores.confidence < entry_cfg.min_confidence:
             rejects.append(f"Confidence {scores.confidence:.0f} < {entry_cfg.min_confidence}")
 
-        reason = self._build_reason(side, snap, fund, opt, macro)
+        reason = reason_prefix + self._build_reason(order_side, snap, fund, opt, macro)
         if strategy_reason:
-            reason = f"[{strat.name}] {strategy_reason}. {reason}"
-        alt = self._alternative(side, snap)
+            reason = f"[{strat.name if strat else trade_type.value}] {strategy_reason}. {reason}"
+        alt = self._alternative(order_side, snap)
         supporting = snap.supporting + ([f"strategy:{t}" for t in strategy_tags] if strategy_tags else [])
 
         rec = TradeRecommendation(
@@ -169,7 +278,7 @@ class QuantXEngine:
             exchange=exchange,
             market_direction=snap.trend,
             trade_type=trade_type,
-            side=side,
+            side=order_side,
             entry=round(levels["entry"], 2),
             stop_loss=round(levels["stop_loss"], 2),
             target_1=round(levels["target_1"], 2),
@@ -180,11 +289,11 @@ class QuantXEngine:
             scores=scores,
             reason=reason,
             supporting_indicators=supporting,
-            fundamental_summary=fund.summary,
-            options_summary=opt.summary,
+            fundamental_summary=fund.summary if not index_sym else "Index underlying — fundamental gate relaxed.",
+            options_summary=options_note,
             risk_notes=(
                 f"Risking ₹{size.capital_at_risk:.0f} ({size.risk_pct:.2f}% of capital). "
-                f"ATR={snap.atr:.2f}. Max daily loss remaining gate applies. "
+                f"ATR={snap.atr:.2f}. Product={trade_type.value}. "
                 + (size.notes or "")
             ),
             alternative_scenario=alt,

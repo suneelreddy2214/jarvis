@@ -2,6 +2,7 @@
 Paper trading session agent — scan, size, execute, mark-to-market.
 
 Runs autonomously under risk gates. Never revenge trades.
+Supports Stocks (equity) and F&O (futures + long options) in the same session.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
 
+from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
 from quantx.core.config import Settings, get_settings
 from quantx.core.engine import QuantXEngine
 from quantx.core.models import TradeRecommendation, TradeType
@@ -43,8 +45,11 @@ class SessionStats:
     running: bool = False
     auto_execute: bool = True
     symbols: list[str] = field(default_factory=lambda: list(DEFAULT_PAPER_UNIVERSE))
+    fo_symbols: list[str] = field(default_factory=lambda: list(DEFAULT_FO_UNIVERSE))
     interval_sec: int = 60
     trade_type: str = "SWING"
+    trade_types: list[str] = field(default_factory=lambda: ["SWING"])
+    enable_fno: bool = False
 
 
 class PaperTradingAgent:
@@ -54,7 +59,7 @@ class PaperTradingAgent:
     Each cycle:
       1. Risk gate check
       2. Mark open positions to market / apply exits
-      3. Scan universe for valid setups
+      3. Scan Stocks + optional F&O universes
       4. Execute top valid signals (if auto_execute) without exceeding max positions
       5. Persist stats
     """
@@ -92,8 +97,11 @@ class PaperTradingAgent:
                 "running": self.stats.running,
                 "auto_execute": self.stats.auto_execute,
                 "symbols": self.stats.symbols,
+                "fo_symbols": self.stats.fo_symbols,
                 "interval_sec": self.stats.interval_sec,
                 "trade_type": self.stats.trade_type,
+                "trade_types": self.stats.trade_types,
+                "enable_fno": self.stats.enable_fno,
                 "started_at": self.stats.started_at,
                 "stopped_at": self.stats.stopped_at,
                 "cycles": self.stats.cycles,
@@ -107,6 +115,7 @@ class PaperTradingAgent:
             },
             "portfolio": snap.model_dump(),
             "risk": risk.model_dump(),
+            "margin": self.portfolio.margin_book(),
         }
 
     def start(
@@ -115,22 +124,48 @@ class PaperTradingAgent:
         interval_sec: int = 60,
         auto_execute: bool = True,
         trade_type: TradeType = TradeType.SWING,
+        enable_fno: bool = False,
+        trade_types: Optional[list[TradeType | str]] = None,
+        fo_symbols: Optional[list[str]] = None,
     ) -> dict:
         with self._lock:
             if self.stats.running:
                 return {"ok": False, "message": "Paper session already running", **self.status()}
+
+            types: list[str]
+            if trade_types:
+                types = [
+                    t.value if isinstance(t, TradeType) else str(t).upper() for t in trade_types
+                ]
+            elif enable_fno:
+                base = trade_type.value if isinstance(trade_type, TradeType) else str(trade_type)
+                types = []
+                for t in [base, TradeType.FUTURES.value, TradeType.OPTIONS.value]:
+                    if t not in types:
+                        types.append(t)
+            else:
+                types = [
+                    trade_type.value if isinstance(trade_type, TradeType) else str(trade_type)
+                ]
+
             self.stats = SessionStats(
                 started_at=datetime.utcnow().isoformat() + "Z",
                 running=True,
                 auto_execute=auto_execute,
                 symbols=symbols or list(DEFAULT_PAPER_UNIVERSE),
+                fo_symbols=fo_symbols or list(DEFAULT_FO_UNIVERSE),
                 interval_sec=max(15, int(interval_sec)),
-                trade_type=trade_type.value if isinstance(trade_type, TradeType) else str(trade_type),
+                trade_type=types[0],
+                trade_types=types,
+                enable_fno=enable_fno or any(
+                    t in (TradeType.FUTURES.value, TradeType.OPTIONS.value) for t in types
+                ),
             )
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, name="quantx-paper-session", daemon=True)
             self._thread.start()
             self.portfolio.db.set_state("paper_session_running", True)
+            self.portfolio.db.set_state("paper_enable_fno", self.stats.enable_fno)
             return {"ok": True, "message": "Paper trading session started", **self.status()}
 
     def stop(self) -> dict:
@@ -154,10 +189,15 @@ class PaperTradingAgent:
             return {"ok": False, "message": "Pass confirm=true to reset paper account"}
         if self.stats.running:
             self.stop()
-        # Flat reset of paper books
         self.portfolio.db.clear_orders()
         self.portfolio.db.clear_journal()
         self.portfolio.db.clear_cycles()
+        # Close any open positions by wiping table via status update
+        for p in self.portfolio.db.list_positions("OPEN"):
+            try:
+                self.portfolio.close_position(p.id, p.current_price, "ACCOUNT RESET")  # type: ignore[arg-type]
+            except Exception:
+                pass
         initial = self.settings.capital.initial
         self.portfolio.risk.update_state(
             capital=initial,
@@ -181,8 +221,10 @@ class PaperTradingAgent:
 
     def _loop(self) -> None:
         logger.info(
-            "Paper session started | symbols=%s interval=%ss auto=%s",
+            "Paper session started | symbols=%s fo=%s types=%s interval=%ss auto=%s",
             self.stats.symbols,
+            self.stats.fo_symbols if self.stats.enable_fno else [],
+            self.stats.trade_types,
             self.stats.interval_sec,
             self.stats.auto_execute,
         )
@@ -195,6 +237,20 @@ class PaperTradingAgent:
             self._stop.wait(self.stats.interval_sec)
         self.stats.running = False
         logger.info("Paper session loop exited")
+
+    def _symbols_for(self, trade_type: str) -> list[str]:
+        if trade_type in (TradeType.FUTURES.value, TradeType.OPTIONS.value):
+            return list(self.stats.fo_symbols)
+        return list(self.stats.symbols)
+
+    def _strategy_for(self, trade_type: str) -> Optional[str]:
+        if trade_type == TradeType.FUTURES.value:
+            return "futures_trend"
+        if trade_type == TradeType.OPTIONS.value:
+            return "options_directional"
+        if trade_type == TradeType.INTRADAY.value:
+            return "intraday_mean_reversion"
+        return None  # default TA path / swing
 
     def _cycle(self) -> dict:
         self.stats.cycles += 1
@@ -227,9 +283,23 @@ class PaperTradingAgent:
                 self._on_cycle(result)
             return result
 
-        # 2) Scan
-        trade_type = TradeType(self.stats.trade_type)
-        recs = self.engine.scan_watchlist(self.stats.symbols, "NSE", trade_type)
+        # 2) Scan all enabled products
+        types = self.stats.trade_types or [self.stats.trade_type]
+        recs: list[TradeRecommendation] = []
+        for tt in types:
+            try:
+                batch = self.engine.scan_watchlist(
+                    self._symbols_for(tt),
+                    "NSE",
+                    TradeType(tt),
+                    strategy=self._strategy_for(tt),
+                )
+                recs.extend(batch)
+            except Exception as e:
+                logger.exception("Scan failed for trade_type=%s", tt)
+                self.stats.last_message = f"scan error ({tt}): {e}"
+
+        recs.sort(key=lambda r: (not r.valid, -r.scores.confidence))
         self.stats.scanned += len(recs)
         valid = [r for r in recs if r.valid]
         self.stats.valid_signals += len(valid)
@@ -237,18 +307,52 @@ class PaperTradingAgent:
         executed: list[dict] = []
         rejected: list[dict] = []
 
-        # 3) Auto-execute top valid (one per cycle per free slot)
+        # 3) Auto-execute top valid (keyed by symbol+trade_type)
         if self.stats.auto_execute:
             max_pos = self.settings.risk.max_open_positions
-            open_syms = {p.symbol for p in self.portfolio.db.list_positions("OPEN")}
-            slots = max_pos - len(open_syms)
+            paper_cfg = getattr(self.settings, "paper", None)
+            max_fo = 2
+            if isinstance(paper_cfg, dict):
+                max_fo = int(paper_cfg.get("max_fo_positions", 2))
+            opens_now = self.portfolio.db.list_positions("OPEN")
+            open_keys = {(p.symbol, p.trade_type.value) for p in opens_now}
+            fo_open = sum(
+                1
+                for p in opens_now
+                if p.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
+            )
+            slots = max_pos - len(opens_now)
             for rec in valid:
+                key = (rec.symbol, rec.trade_type.value)
+                is_fo = rec.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
                 if slots <= 0:
-                    rejected.append({"symbol": rec.symbol, "reason": "Max open positions — no free slot"})
+                    rejected.append(
+                        {
+                            "symbol": rec.symbol,
+                            "trade_type": rec.trade_type.value,
+                            "reason": "Max open positions — no free slot",
+                        }
+                    )
                     self.stats.rejected += 1
                     continue
-                if rec.symbol in open_syms:
-                    rejected.append({"symbol": rec.symbol, "reason": "Already in position — no averaging"})
+                if is_fo and fo_open >= max_fo:
+                    rejected.append(
+                        {
+                            "symbol": rec.symbol,
+                            "trade_type": rec.trade_type.value,
+                            "reason": f"Max F&O positions ({max_fo})",
+                        }
+                    )
+                    self.stats.rejected += 1
+                    continue
+                if key in open_keys:
+                    rejected.append(
+                        {
+                            "symbol": rec.symbol,
+                            "trade_type": rec.trade_type.value,
+                            "reason": "Already in position — no averaging",
+                        }
+                    )
                     self.stats.rejected += 1
                     continue
                 fill = self.broker.retry_safe(rec)
@@ -256,6 +360,7 @@ class PaperTradingAgent:
                     executed.append(
                         {
                             "symbol": rec.symbol,
+                            "trade_type": rec.trade_type.value,
                             "side": rec.side.value,
                             "quantity": rec.quantity,
                             "fill_price": fill.get("fill_price", rec.entry),
@@ -263,16 +368,25 @@ class PaperTradingAgent:
                             "message": fill.get("message", ""),
                         }
                     )
-                    open_syms.add(rec.symbol)
+                    open_keys.add(key)
                     slots -= 1
+                    if is_fo:
+                        fo_open += 1
                     self.stats.executed += 1
                 else:
-                    rejected.append({"symbol": rec.symbol, "reason": fill.get("message", "rejected")})
+                    rejected.append(
+                        {
+                            "symbol": rec.symbol,
+                            "trade_type": rec.trade_type.value,
+                            "reason": fill.get("message", "rejected"),
+                        }
+                    )
                     self.stats.rejected += 1
 
         msg = (
             f"Cycle #{self.stats.cycles}: MTM closed {closed}, "
-            f"valid {len(valid)}/{len(recs)}, executed {len(executed)}, rejected {len(rejected)}"
+            f"valid {len(valid)}/{len(recs)} ({','.join(types)}), "
+            f"executed {len(executed)}, rejected {len(rejected)}"
         )
         self.stats.last_message = msg
         logger.info(msg)
@@ -287,8 +401,11 @@ class PaperTradingAgent:
             "rejected": rejected,
             "executed_count": len(executed),
             "rejected_count": len(rejected),
+            "trade_types": types,
+            "enable_fno": self.stats.enable_fno,
             "message": msg,
             "portfolio": self.portfolio.snapshot().model_dump(),
+            "margin": self.portfolio.margin_book(),
             "created_at": self.stats.last_cycle_at,
         }
         self._persist_cycle(result)

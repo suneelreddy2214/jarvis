@@ -22,6 +22,7 @@ from quantx.core.models import TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST, MarketDataService
 from quantx.execution.base import PaperBrokerAdapter, broker_credentials_present
 from quantx.execution.broker import PaperBroker
+from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
 from quantx.execution.paper_agent import DEFAULT_PAPER_UNIVERSE, get_paper_agent
 from quantx.portfolio.db import Database
 from quantx.portfolio.manager import PortfolioManager
@@ -142,6 +143,8 @@ class ScanRequest(BaseModel):
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
     strategy: Optional[str] = None
+    enable_fno: bool = False
+    fo_symbols: Optional[list[str]] = None
 
 
 class ExecuteRequest(BaseModel):
@@ -171,6 +174,9 @@ class PaperStartRequest(BaseModel):
     interval_sec: int = 60
     auto_execute: bool = True
     trade_type: TradeType = TradeType.SWING
+    enable_fno: bool = True
+    trade_types: Optional[list[TradeType]] = None
+    fo_symbols: Optional[list[str]] = None
 
 
 class PaperResetRequest(BaseModel):
@@ -360,23 +366,52 @@ def close_position(req: CloseRequest):
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
-    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=req.strategy)
+    strat = req.strategy
+    if not strat:
+        if req.trade_type == TradeType.FUTURES:
+            strat = "futures_trend"
+        elif req.trade_type == TradeType.OPTIONS:
+            strat = "options_directional"
+    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=strat)
     return rec.model_dump(mode="json")
 
 
 @app.post("/api/scan")
 def scan(req: ScanRequest):
-    results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type, strategy=req.strategy)
+    results = []
+    if req.enable_fno:
+        # Stocks + Futures + Options in one pass
+        equity = engine.scan_watchlist(req.symbols, req.exchange, TradeType.SWING, strategy=req.strategy)
+        fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
+        futs = engine.scan_watchlist(fo_syms, req.exchange, TradeType.FUTURES, strategy="futures_trend")
+        opts = engine.scan_watchlist(fo_syms, req.exchange, TradeType.OPTIONS, strategy="options_directional")
+        results = equity + futs + opts
+        results.sort(key=lambda r: (not r.valid, -r.scores.confidence))
+    else:
+        strat = req.strategy
+        if not strat:
+            if req.trade_type == TradeType.FUTURES:
+                strat = "futures_trend"
+            elif req.trade_type == TradeType.OPTIONS:
+                strat = "options_directional"
+        results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type, strategy=strat)
     return {
         "count": len(results),
         "valid_count": sum(1 for r in results if r.valid),
+        "enable_fno": req.enable_fno,
         "recommendations": [r.model_dump(mode="json") for r in results],
     }
 
 
 @app.post("/api/execute")
 def execute(req: ExecuteRequest):
-    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=req.strategy)
+    strat = req.strategy
+    if not strat:
+        if req.trade_type == TradeType.FUTURES:
+            strat = "futures_trend"
+        elif req.trade_type == TradeType.OPTIONS:
+            strat = "options_directional"
+    rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=strat)
     result = broker.retry_safe(rec)
     result["recommendation"] = rec.model_dump(mode="json")
     return result
@@ -465,6 +500,9 @@ def paper_start(req: PaperStartRequest):
         interval_sec=req.interval_sec,
         auto_execute=req.auto_execute,
         trade_type=req.trade_type,
+        enable_fno=req.enable_fno,
+        trade_types=req.trade_types,
+        fo_symbols=req.fo_symbols,
     )
 
 

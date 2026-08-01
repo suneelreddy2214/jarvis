@@ -77,6 +77,17 @@ broker:
 paper:
   auto_execute: true
   default_interval_sec: 60
+  enable_fno: true
+  max_fo_positions: 2
+  fo_universe:
+    - NIFTY
+    - BANKNIFTY
+    - RELIANCE
+    - TCS
+    - INFY
+    - HDFCBANK
+    - ICICIBANK
+    - SBIN
   universe:
     - RELIANCE
     - TCS
