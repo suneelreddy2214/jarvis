@@ -476,6 +476,53 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(opts),
     }),
+  search: (q: string, limit = 20) =>
+    req<{
+      query: string
+      universe_size: number
+      results: Array<{
+        symbol: string
+        exchange: string
+        price: number | null
+        change_pct: number | null
+        is_index: boolean
+        fno: boolean
+        segment: string
+      }>
+    }>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  fnoOverview: (symbol: string) =>
+    req<{
+      symbol: string
+      exchange: string
+      spot: number
+      change_pct: number
+      futures: { ltp: number; basis: number; basis_pct: number; lot_size: number }
+      expiries: Array<{ expiry: string; label: string; kind: string; days_to_expiry: number }>
+      default_expiry: string | null
+      is_index: boolean
+      atr: number
+    }>(`/api/fno/${encodeURIComponent(symbol)}`),
+  fnoChain: (symbol: string, expiry?: string) =>
+    req<{
+      symbol: string
+      spot: number
+      atm_strike: number
+      strike_step: number
+      expiry: string
+      expiry_label: string
+      days_to_expiry: number
+      lot_size: number
+      pcr: number | null
+      max_pain: number
+      iv_atm_pct: number
+      note: string
+      rows: Array<{
+        strike: number
+        is_atm: boolean
+        call: { type: string; ltp: number; iv: number; oi: number; volume: number; change: number }
+        put: { type: string; ltp: number; iv: number; oi: number; volume: number; change: number }
+      }>
+    }>(`/api/fno/${encodeURIComponent(symbol)}/chain${expiry ? `?expiry=${encodeURIComponent(expiry)}` : ''}`),
   backtest: (symbol: string, strategy = 'swing_trend', period = '1y') =>
     req<{
       strategy: string

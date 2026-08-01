@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from quantx import __version__
 from quantx.analysis.backtest import Backtester
 from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
+from quantx.analysis.option_chain import FnoSearchService, SEARCH_UNIVERSE
 from quantx.analysis.strategies import list_strategies
 import quantx.analysis.additional_strategies  # noqa: F401 — register additive strategies
 from quantx.analysis.learning import StrategyLearner
@@ -46,6 +47,7 @@ clock = MarketClock(settings)
 paper_agent = get_paper_agent(portfolio=portfolio, engine=engine, broker=broker, settings=settings)
 paper_adapter = PaperBrokerAdapter(broker)
 backtester = Backtester(settings=settings, market_data=market_data)
+fno_search = FnoSearchService(market_data=market_data)
 
 
 def _chat_context() -> dict:
@@ -613,6 +615,42 @@ def paper_cycles(limit: int = 50):
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str, exchange: str = "NSE"):
     return market_data.get_quote(symbol, exchange)
+
+
+@app.get("/api/search")
+def search_symbols(q: str = Query("", description="Symbol search text"), limit: int = Query(20, ge=1, le=50)):
+    """Search stocks / indices for the Search tab."""
+    return {"query": q, "results": fno_search.search(q, limit=limit), "universe_size": len(SEARCH_UNIVERSE)}
+
+
+@app.get("/api/fno/{symbol}")
+def fno_overview(symbol: str):
+    """Spot, futures basis, and available option expiry dates."""
+    try:
+        return fno_search.overview(symbol)
+    except Exception as e:
+        raise HTTPException(404, f"Symbol unavailable: {e}")
+
+
+@app.get("/api/fno/{symbol}/expiries")
+def fno_expiries(symbol: str):
+    try:
+        ov = fno_search.overview(symbol)
+        return {"symbol": ov["symbol"], "spot": ov["spot"], "expiries": ov["expiries"]}
+    except Exception as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/fno/{symbol}/chain")
+def fno_chain(symbol: str, expiry: Optional[str] = Query(None, description="YYYY-MM-DD expiry")):
+    """Call/Put option chain for selected expiry."""
+    try:
+        return fno_search.chain(symbol, expiry=expiry)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("Option chain failed for %s", symbol)
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/macro")

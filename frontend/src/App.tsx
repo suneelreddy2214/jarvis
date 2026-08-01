@@ -78,8 +78,25 @@ export default function App() {
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
-  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl' | 'chat' | 'margin'>('overview')
+  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl' | 'chat' | 'margin' | 'search'>('overview')
   const [marginBook, setMarginBook] = useState<MarginBook | null>(null)
+  const [searchQuery, setSearchQuery] = useState('NIFTY')
+  const [searchResults, setSearchResults] = useState<
+    Array<{
+      symbol: string
+      exchange: string
+      price: number | null
+      change_pct: number | null
+      is_index: boolean
+      fno: boolean
+      segment: string
+    }>
+  >([])
+  const [searchSymbol, setSearchSymbol] = useState('NIFTY')
+  const [fnoOverview, setFnoOverview] = useState<Awaited<ReturnType<typeof api.fnoOverview>> | null>(null)
+  const [selectedExpiry, setSelectedExpiry] = useState('')
+  const [optionChain, setOptionChain] = useState<Awaited<ReturnType<typeof api.fnoChain>> | null>(null)
+  const [searchBusy, setSearchBusy] = useState(false)
   const [orders, setOrders] = useState<
     Array<{
       id: number
@@ -424,6 +441,61 @@ export default function App() {
     }
   }
 
+  const runSymbolSearch = async (q?: string) => {
+    const query = (q ?? searchQuery).trim()
+    setSearchBusy(true)
+    try {
+      const res = await api.search(query)
+      setSearchResults(res.results)
+      if (!query && res.results[0]) {
+        // keep current
+      }
+      setStatus(`Search: ${res.results.length} symbols`)
+    } catch (err) {
+      setStatus(`Search failed: ${(err as Error).message}`)
+    } finally {
+      setSearchBusy(false)
+    }
+  }
+
+  const loadFnoSymbol = async (symbol: string, expiry?: string) => {
+    setSearchBusy(true)
+    setSearchSymbol(symbol)
+    try {
+      const ov = await api.fnoOverview(symbol)
+      setFnoOverview(ov)
+      const exp = expiry || ov.default_expiry || ov.expiries[0]?.expiry || ''
+      setSelectedExpiry(exp)
+      if (exp) {
+        const chain = await api.fnoChain(symbol, exp)
+        setOptionChain(chain)
+      } else {
+        setOptionChain(null)
+      }
+      setStatus(`Loaded F&O chain for ${symbol}`)
+    } catch (err) {
+      setFnoOverview(null)
+      setOptionChain(null)
+      setStatus(`F&O load failed: ${(err as Error).message}`)
+    } finally {
+      setSearchBusy(false)
+    }
+  }
+
+  const changeExpiry = async (expiry: string) => {
+    setSelectedExpiry(expiry)
+    if (!searchSymbol || !expiry) return
+    setSearchBusy(true)
+    try {
+      const chain = await api.fnoChain(searchSymbol, expiry)
+      setOptionChain(chain)
+    } catch (err) {
+      setStatus(`Expiry chain failed: ${(err as Error).message}`)
+    } finally {
+      setSearchBusy(false)
+    }
+  }
+
   const setCapitalAbsolute = async () => {
     const n = Number(capitalDelta)
     if (!Number.isFinite(n) || n < 10000) {
@@ -623,6 +695,13 @@ export default function App() {
         <button className={`tab${tab === 'overview' ? ' active' : ''}`} onClick={() => setTab('overview')} type="button">
           Overview
         </button>
+        <button className={`tab${tab === 'search' ? ' active' : ''}`} onClick={() => {
+          setTab('search')
+          if (!searchResults.length) void runSymbolSearch(searchQuery)
+          if (!optionChain) void loadFnoSymbol(searchSymbol)
+        }} type="button">
+          Search / F&amp;O
+        </button>
         <button className={`tab${tab === 'margin' ? ' active' : ''}`} onClick={() => setTab('margin')} type="button">
           Stocks / F&amp;O
           <span className="count">{(marginBook?.stocks_count || 0) + (marginBook?.fno_count || 0)}</span>
@@ -640,6 +719,220 @@ export default function App() {
           Chat
         </button>
       </nav>
+
+      {tab === 'search' && (
+        <div className="margin-page">
+          <section className="panel" style={{ marginBottom: '1rem' }}>
+            <div className="panel-head">
+              <h2>Search Stocks &amp; F&amp;O</h2>
+              <div className="actions">
+                <button className="btn" type="button" disabled={searchBusy} onClick={() => void runSymbolSearch()}>
+                  Search
+                </button>
+              </div>
+            </div>
+            <div className="scan-row">
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void runSymbolSearch()
+                }}
+                placeholder="Search symbol e.g. NIFTY, BANKNIFTY, RELIANCE, TCS"
+              />
+            </div>
+            <div className="chips" style={{ marginBottom: '0.75rem' }}>
+              {['NIFTY', 'BANKNIFTY', 'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'SBIN'].map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  className="chip"
+                  style={{ cursor: 'pointer', border: 'none', background: searchSymbol === s ? 'var(--teal-dim)' : undefined }}
+                  onClick={() => {
+                    setSearchQuery(s)
+                    void runSymbolSearch(s)
+                    void loadFnoSymbol(s)
+                  }}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            {searchResults.length > 0 && (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Segment</th>
+                    <th>LTP</th>
+                    <th>Chg%</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {searchResults.map((r) => (
+                    <tr key={r.symbol} style={{ cursor: 'pointer' }} onClick={() => void loadFnoSymbol(r.symbol)}>
+                      <td>{r.symbol}</td>
+                      <td>
+                        <span className="pill valid">{r.is_index ? 'INDEX' : 'EQ'}</span>
+                      </td>
+                      <td>{r.price != null ? inrDec(r.price) : '—'}</td>
+                      <td className={(r.change_pct || 0) >= 0 ? 'pos' : 'neg'}>
+                        {r.change_pct != null ? pct(r.change_pct) : '—'}
+                      </td>
+                      <td>
+                        <button className="btn" type="button" onClick={(e) => { e.stopPropagation(); void loadFnoSymbol(r.symbol) }}>
+                          F&amp;O Chain
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+
+          {fnoOverview && (
+            <section className="panel" style={{ marginBottom: '1rem' }}>
+              <div className="panel-head">
+                <h2>
+                  {fnoOverview.symbol} · Spot {inrDec(fnoOverview.spot)}
+                </h2>
+                <span className={`pill ${(fnoOverview.change_pct || 0) >= 0 ? 'buy' : 'sell'}`}>
+                  {pct(fnoOverview.change_pct || 0)}
+                </span>
+              </div>
+              <div className="rec-grid">
+                <div className="rec-cell">
+                  <span>Futures LTP</span>
+                  <strong>{inrDec(fnoOverview.futures.ltp)}</strong>
+                </div>
+                <div className="rec-cell">
+                  <span>Basis</span>
+                  <strong>
+                    {inrDec(fnoOverview.futures.basis)} ({fnoOverview.futures.basis_pct}%)
+                  </strong>
+                </div>
+                <div className="rec-cell">
+                  <span>Fut lot</span>
+                  <strong>{fnoOverview.futures.lot_size}</strong>
+                </div>
+                <div className="rec-cell">
+                  <span>ATR</span>
+                  <strong>{inrDec(fnoOverview.atr)}</strong>
+                </div>
+              </div>
+
+              <div className="panel-head" style={{ marginTop: '1rem' }}>
+                <h2 style={{ fontSize: '1rem' }}>Expiry Dates</h2>
+              </div>
+              <div className="chips" style={{ marginBottom: '0.75rem' }}>
+                {fnoOverview.expiries.map((ex) => (
+                  <button
+                    key={ex.expiry}
+                    type="button"
+                    className="chip"
+                    style={{
+                      cursor: 'pointer',
+                      border: 'none',
+                      background: selectedExpiry === ex.expiry ? 'var(--teal-dim)' : undefined,
+                      color: selectedExpiry === ex.expiry ? 'var(--teal)' : undefined,
+                    }}
+                    onClick={() => void changeExpiry(ex.expiry)}
+                  >
+                    {ex.label} · {ex.kind} · {ex.days_to_expiry}d
+                  </button>
+                ))}
+              </div>
+
+              {optionChain && (
+                <>
+                  <div className="rec-grid" style={{ marginBottom: '0.75rem' }}>
+                    <div className="rec-cell">
+                      <span>Expiry</span>
+                      <strong>{optionChain.expiry_label}</strong>
+                    </div>
+                    <div className="rec-cell">
+                      <span>ATM</span>
+                      <strong>{optionChain.atm_strike}</strong>
+                    </div>
+                    <div className="rec-cell">
+                      <span>PCR</span>
+                      <strong>{optionChain.pcr ?? '—'}</strong>
+                    </div>
+                    <div className="rec-cell">
+                      <span>Max Pain</span>
+                      <strong>{optionChain.max_pain}</strong>
+                    </div>
+                    <div className="rec-cell">
+                      <span>IV ATM</span>
+                      <strong>{optionChain.iv_atm_pct}%</strong>
+                    </div>
+                    <div className="rec-cell">
+                      <span>Opt lot</span>
+                      <strong>{optionChain.lot_size}</strong>
+                    </div>
+                  </div>
+                  <p className="empty" style={{ marginBottom: '0.5rem' }}>
+                    {optionChain.note}
+                  </p>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table className="table option-chain">
+                      <thead>
+                        <tr>
+                          <th colSpan={4} style={{ textAlign: 'center', color: 'var(--teal)' }}>
+                            CALL (CE)
+                          </th>
+                          <th style={{ textAlign: 'center' }}>Strike</th>
+                          <th colSpan={4} style={{ textAlign: 'center', color: 'var(--amber)' }}>
+                            PUT (PE)
+                          </th>
+                        </tr>
+                        <tr>
+                          <th>OI</th>
+                          <th>Vol</th>
+                          <th>IV%</th>
+                          <th>LTP</th>
+                          <th>Strike</th>
+                          <th>LTP</th>
+                          <th>IV%</th>
+                          <th>Vol</th>
+                          <th>OI</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {optionChain.rows.map((row) => (
+                          <tr
+                            key={row.strike}
+                            style={{
+                              background: row.is_atm ? 'rgba(62, 207, 172, 0.08)' : undefined,
+                            }}
+                          >
+                            <td>{row.call.oi.toLocaleString('en-IN')}</td>
+                            <td>{row.call.volume.toLocaleString('en-IN')}</td>
+                            <td>{row.call.iv.toFixed(1)}</td>
+                            <td className="pos">{inrDec(row.call.ltp)}</td>
+                            <td>
+                              <strong>
+                                {row.strike}
+                                {row.is_atm ? ' · ATM' : ''}
+                              </strong>
+                            </td>
+                            <td className="neg">{inrDec(row.put.ltp)}</td>
+                            <td>{row.put.iv.toFixed(1)}</td>
+                            <td>{row.put.volume.toLocaleString('en-IN')}</td>
+                            <td>{row.put.oi.toLocaleString('en-IN')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </section>
+          )}
+        </div>
+      )}
 
       {tab === 'margin' && (
         <div className="margin-page">
