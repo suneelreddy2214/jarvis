@@ -568,6 +568,96 @@ button {
   color: var(--teal);
 }
 
+.chat-shell {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  min-height: 520px;
+  gap: 0.75rem;
+}
+
+.chat-log {
+  overflow: auto;
+  max-height: 58vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.25rem;
+}
+
+.chat-bubble {
+  max-width: min(720px, 92%);
+  padding: 0.75rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  font-size: 0.9rem;
+  animation: fadeUp 0.25s ease both;
+}
+
+.chat-bubble.user {
+  align-self: flex-end;
+  background: rgba(62, 207, 172, 0.12);
+  border-color: rgba(62, 207, 172, 0.3);
+}
+
+.chat-bubble.assistant {
+  align-self: flex-start;
+  background: var(--bg-0);
+}
+
+.chat-bubble .who {
+  display: block;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+  font-family: var(--mono);
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.chat-input-row textarea {
+  flex: 1;
+  min-height: 52px;
+  resize: vertical;
+  background: var(--bg-0);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 0.7rem 0.85rem;
+  font: inherit;
+}
+
+.chat-input-row textarea:focus {
+  outline: 1px solid rgba(62, 207, 172, 0.45);
+}
+
+.chat-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.chat-hints button {
+  border: 1px solid var(--line);
+  background: var(--bg-0);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 0.3rem 0.65rem;
+  font-size: 0.75rem;
+}
+
+.chat-hints button:hover {
+  color: var(--text);
+  border-color: rgba(62, 207, 172, 0.4);
+}
+
 .report-box {
   white-space: pre-wrap;
   font-family: var(--mono);

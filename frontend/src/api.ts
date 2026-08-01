@@ -275,6 +275,11 @@ export const api = {
         exit_reason?: string | null
       }>
     }>('/api/pnl'),
+  chat: (message: string, history: Array<{ role: string; content: string }> = []) =>
+    req<{ role: string; content: string; timestamp: string; sources: string[] }>('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message, history }),
+    }),
   cycles: () =>
     req<
       Array<{

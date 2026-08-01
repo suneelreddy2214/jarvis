@@ -67,7 +67,7 @@ export default function App() {
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
-  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl'>('overview')
+  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl' | 'chat'>('overview')
   const [orders, setOrders] = useState<
     Array<{
       id: number
@@ -97,6 +97,16 @@ export default function App() {
     }>
   >([])
   const [pnlData, setPnlData] = useState<Awaited<ReturnType<typeof api.pnl>> | null>(null)
+  const [chatInput, setChatInput] = useState('')
+  const [chatBusy, setChatBusy] = useState(false)
+  const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; timestamp?: string }>>([
+    {
+      role: 'assistant',
+      content:
+        'Hi — I am QuantX. Ask me about P&L, positions, orders, risk limits, cycles, or how trading works. Example: "What\'s my P&L?" or "Why were trades rejected?"',
+      timestamp: new Date().toISOString(),
+    },
+  ])
 
   const refresh = useCallback(async () => {
     try {
@@ -231,6 +241,30 @@ export default function App() {
       setBrokerInfo(`${b.name} · ${b.mode} · ${b.message} · live_ready=${b.live_ready}`)
     } catch (err) {
       setBrokerInfo((err as Error).message)
+    }
+  }
+
+  const sendChat = async (preset?: string) => {
+    const text = (preset ?? chatInput).trim()
+    if (!text || chatBusy) return
+    setChatBusy(true)
+    setChatInput('')
+    const userMsg = { role: 'user' as const, content: text, timestamp: new Date().toISOString() }
+    setChatMessages((prev) => [...prev, userMsg])
+    try {
+      const history = [...chatMessages, userMsg].map((m) => ({ role: m.role, content: m.content }))
+      const res = await api.chat(text, history)
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: res.content, timestamp: res.timestamp },
+      ])
+    } catch (err) {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: `Chat error: ${(err as Error).message}`, timestamp: new Date().toISOString() },
+      ])
+    } finally {
+      setChatBusy(false)
     }
   }
 
@@ -423,7 +457,58 @@ export default function App() {
         <button className={`tab${tab === 'cycles' ? ' active' : ''}`} onClick={() => setTab('cycles')} type="button">
           Cycles<span className="count">{paperStats.cycles || cycles.length}</span>
         </button>
+        <button className={`tab${tab === 'chat' ? ' active' : ''}`} onClick={() => setTab('chat')} type="button">
+          Chat
+        </button>
       </nav>
+
+      {tab === 'chat' && (
+        <section className="panel" style={{ marginBottom: '1rem' }}>
+          <div className="panel-head">
+            <h2>Chat with QuantX</h2>
+          </div>
+          <div className="chat-hints">
+            {[
+              "What's my P&L?",
+              'Show open positions',
+              'Why were trades rejected?',
+              'What are risk limits?',
+              'Explain last cycle',
+              'How does QuantX trade?',
+            ].map((q) => (
+              <button key={q} type="button" disabled={chatBusy} onClick={() => sendChat(q)}>
+                {q}
+              </button>
+            ))}
+          </div>
+          <div className="chat-shell">
+            <div className="chat-log">
+              {chatMessages.map((m, i) => (
+                <div key={`${m.role}-${i}`} className={`chat-bubble ${m.role}`}>
+                  <span className="who">{m.role === 'user' ? 'You' : 'QuantX'}</span>
+                  {m.content}
+                </div>
+              ))}
+            </div>
+            <div className="chat-input-row">
+              <textarea
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder="Ask QuantX anything about your paper book, risk, orders, cycles…"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    sendChat()
+                  }
+                }}
+              />
+              <button className="btn primary" disabled={chatBusy || !chatInput.trim()} onClick={() => sendChat()}>
+                {chatBusy ? '…' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
 
       {tab === 'orders' && (
         <section className="panel" style={{ marginBottom: '1rem' }}>

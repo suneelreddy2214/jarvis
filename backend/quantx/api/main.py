@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from quantx import __version__
 from quantx.analysis.backtest import Backtester
 from quantx.analysis.strategies import list_strategies
+from quantx.core.chat import QuantXChat
 from quantx.core.config import get_settings
 from quantx.core.emergency import EmergencyController
 from quantx.core.engine import QuantXEngine
@@ -41,6 +42,46 @@ clock = MarketClock(settings)
 paper_agent = get_paper_agent(portfolio=portfolio, engine=engine, broker=broker, settings=settings)
 paper_adapter = PaperBrokerAdapter(broker)
 backtester = Backtester(settings=settings, market_data=market_data)
+
+
+def _chat_context() -> dict:
+    snap = portfolio.snapshot()
+    risk = portfolio.risk.status()
+    opens = [p.model_dump(mode="json") for p in db.list_positions("OPEN")]
+    closed = [p.model_dump(mode="json") for p in db.list_positions("CLOSED")]
+    paper = paper_agent.status().get("session", {})
+    return {
+        "portfolio": snap.model_dump(),
+        "risk": risk.model_dump(),
+        "positions": opens + closed,
+        "open_positions": opens,
+        "orders": db.list_orders(100),
+        "cycles": paper_agent.list_cycles(20),
+        "journal": [j.model_dump(mode="json") for j in db.list_journal(50)],
+        "performance": portfolio.performance(),
+        "pnl": {
+            "summary": {
+                "capital": snap.capital,
+                "total_pnl": snap.total_pnl,
+                "unrealized_pnl": snap.unrealized_pnl,
+                "closed_realized_pnl": snap.realized_pnl_today,
+                "total_fees": portfolio.performance().get("total_fees", 0),
+                "win_rate": portfolio.performance().get("win_rate", 0),
+                "wins": portfolio.performance().get("wins", 0),
+                "losses": portfolio.performance().get("losses", 0),
+                "open_positions": snap.open_positions,
+                "closed_trades": len(closed),
+            }
+        },
+        "paper": paper,
+        "emergency": emergency.state().model_dump(),
+        "macro": market_data.get_macro_snapshot(),
+        "config": {"risk": settings.risk.model_dump()},
+        "watchlist_symbols": list(DEFAULT_PAPER_UNIVERSE),
+    }
+
+
+chat_assistant = QuantXChat(_chat_context)
 
 
 @asynccontextmanager
@@ -121,6 +162,11 @@ class BacktestRequest(BaseModel):
     exchange: str = "NSE"
     period: str = "1y"
     capital: Optional[float] = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict] = Field(default_factory=list)
 
 
 @app.get("/api/health")
@@ -335,6 +381,17 @@ def broker_status():
         "Set QUANTX_BROKER_* env vars and mode=live to enable Zerodha Kite."
     )
     return status
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    if not req.message or not req.message.strip():
+        raise HTTPException(400, "message is required")
+    try:
+        return chat_assistant.ask(req.message.strip(), history=req.history)
+    except Exception as e:
+        logger.exception("Chat failed")
+        raise HTTPException(500, str(e))
 
 
 # —— Paper trading session ——
