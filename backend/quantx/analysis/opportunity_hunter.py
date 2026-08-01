@@ -366,6 +366,7 @@ class OpportunityHunter:
         exchange: str = "NSE",
         enable_fno: bool = True,
         trade_type: str = "SWING",
+        trade_types: Optional[list[str]] = None,
         style_ids: Optional[list[str]] = None,
         min_score: float = 52.0,
         strategies_per_product: int = 2,
@@ -376,25 +377,29 @@ class OpportunityHunter:
             exchange=exchange,
             seed_symbols=seed_symbols,
             min_score=min_score,
-            include_indices=enable_fno or trade_type in ("FUTURES", "OPTIONS", "ALL"),
+            include_indices=enable_fno or trade_type in ("FUTURES", "OPTIONS", "ALL")
+            or bool(trade_types and any(t in ("FUTURES", "OPTIONS") for t in trade_types)),
         )
         symbols = [c.symbol for c in hunted]
         if not symbols and seed_symbols:
             symbols = [s.strip().upper() for s in seed_symbols if s.strip()]
 
-        if enable_fno or trade_type == "ALL":
+        if trade_types:
+            types = [str(t).upper() for t in trade_types]
+        elif enable_fno or trade_type == "ALL":
             types = ["SWING", "INTRADAY", "FUTURES", "OPTIONS"]
         elif trade_type == "SWING":
             types = ["SWING", "INTRADAY"]
         else:
             types = [trade_type]
 
-        # If styles requested, expand types to style products
+        # Keep products within the operator multi-select (don't force F&O on Stocks-only)
         if style_ids:
-            extra: set[str] = set(types)
-            for st in resolve_style_ids(style_ids):
-                extra.update(st.trade_types)
-            types = [t for t in ["SWING", "INTRADAY", "FUTURES", "OPTIONS"] if t in extra] or types
+            style_ids = [s.id for s in resolve_style_ids(style_ids)]
+            allowed = set(types)
+            types = [t for t in ["SWING", "INTRADAY", "FUTURES", "OPTIONS"] if t in allowed]
+            if not types:
+                types = list(allowed) or ["SWING"]
 
         recs, strat_map, regime = self.process_symbols(
             symbols,
@@ -403,6 +408,28 @@ class OpportunityHunter:
             style_ids=style_ids,
             strategies_per_product=strategies_per_product,
         )
+
+        # Never return empty strategy map — fallback core models
+        if not strat_map or not any(strat_map.values()):
+            strat_map = {}
+            for tt in types:
+                if tt == "FUTURES":
+                    strat_map[tt] = ["futures_trend"]
+                elif tt == "OPTIONS":
+                    strat_map[tt] = ["options_directional"]
+                elif tt == "INTRADAY":
+                    strat_map[tt] = ["intraday_momentum"]
+                else:
+                    strat_map[tt] = ["swing_trend"]
+            recs2, _, _ = self.process_symbols(
+                symbols,
+                exchange=exchange,
+                trade_types=types,
+                style_ids=None,
+                strategies_per_product=1,
+            )
+            if recs2:
+                recs = recs2
 
         styles_used = []
         if style_ids:
@@ -416,7 +443,6 @@ class OpportunityHunter:
                 for st in resolve_style_ids(style_ids)
             ]
         else:
-            # summarize styles whose strategies were used
             used = {n for names in strat_map.values() for n in names}
             for st in TRADING_STYLES:
                 if any(x in used for x in st.strategies):
@@ -437,6 +463,7 @@ class OpportunityHunter:
             "universe_size": len(HUNT_UNIVERSE),
             "strategies_used": strat_map,
             "styles_touched": styles_used[:12],
+            "trade_types": types,
             "regime": regime,
             "count": len(recs),
             "valid_count": sum(1 for r in recs if r.valid),

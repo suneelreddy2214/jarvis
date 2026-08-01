@@ -201,9 +201,12 @@ class QuantXEngine:
         min_vol = float(getattr(entry_cfg, "min_volume_ratio", 1.0) or 1.0)
         if entry_cfg.require_volume and snap.volume_ratio < min_vol and not index_sym:
             rejects.append(f"Volume not confirmed (ratio {snap.volume_ratio:.2f} < {min_vol:.2f})")
-        # Fundamentals: skip / relax for index F&O
+        # Fundamentals: skip / relax for index F&O and short-horizon intraday
         if not index_sym and fund.score < entry_cfg.min_fundamental_score:
-            if trade_type not in (TradeType.FUTURES, TradeType.OPTIONS):
+            if trade_type == TradeType.INTRADAY:
+                # Intraday is technical — soft-warn via size cut only (below)
+                pass
+            elif trade_type not in (TradeType.FUTURES, TradeType.OPTIONS):
                 rejects.append(f"Fundamental score {fund.score:.0f} < {entry_cfg.min_fundamental_score}")
             elif fund.score < entry_cfg.min_fundamental_score - 15:
                 rejects.append(f"Fundamental score {fund.score:.0f} too weak for stock F&O")

@@ -83,8 +83,8 @@ export default function App() {
   } | null>(null)
   const [strategy, setStrategy] = useState('swing_trend')
   const [enableFno, setEnableFno] = useState(true)
-  const [scanProduct, setScanProduct] = useState<'ALL' | 'SWING' | 'FUTURES' | 'OPTIONS'>('ALL')
-  const [scanStyle, setScanStyle] = useState<string>('all')
+  const [scanProducts, setScanProducts] = useState<string[]>(['SWING', 'INTRADAY', 'FUTURES', 'OPTIONS'])
+  const [scanStyles, setScanStyles] = useState<string[]>(['all'])
   const [huntMarket, setHuntMarket] = useState(true)
   const [hunted, setHunted] = useState<
     Array<{
@@ -280,10 +280,36 @@ export default function App() {
     return () => clearInterval(id)
   }, [refresh, paperRunning])
 
+  const PRODUCT_OPTIONS = [
+    { id: 'SWING', label: 'Stocks' },
+    { id: 'INTRADAY', label: 'Intraday' },
+    { id: 'FUTURES', label: 'Futures' },
+    { id: 'OPTIONS', label: 'Options' },
+  ] as const
+
+  const toggleProduct = (id: string) => {
+    setScanProducts((prev) => {
+      const has = prev.includes(id)
+      const next = has ? prev.filter((x) => x !== id) : [...prev, id]
+      const final = next.length ? next : ['SWING']
+      setEnableFno(final.some((p) => p === 'FUTURES' || p === 'OPTIONS'))
+      return final
+    })
+  }
+
   const styleIdsForRequest = (): string[] | undefined => {
-    if (!scanStyle || scanStyle === 'auto') return undefined
-    if (scanStyle === 'all') return ['all']
-    return [scanStyle]
+    if (!scanStyles.length || scanStyles.includes('auto')) return undefined
+    if (scanStyles.includes('all')) return ['all']
+    return [...scanStyles]
+  }
+
+  const styleLabelForStatus = () => {
+    if (!scanStyles.length || scanStyles.includes('auto')) return 'regime selector'
+    if (scanStyles.includes('all')) return 'all trading styles'
+    return scanStyles
+      .map((id) => styleGroups.find((g) => g.id === id)?.name || id)
+      .slice(0, 4)
+      .join(', ')
   }
 
   const startPaper = async () => {
@@ -291,28 +317,15 @@ export default function App() {
     try {
       const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
       const styleIds = styleIdsForRequest()
-      const tradeTypes = enableFno
-        ? ['SWING', 'INTRADAY', 'FUTURES', 'OPTIONS']
-        : scanStyle !== 'auto'
-          ? ['SWING', 'INTRADAY']
-          : ['SWING']
+      const products = scanProducts.length ? scanProducts : ['SWING']
+      const useFno = products.some((p) => p === 'FUTURES' || p === 'OPTIONS')
       await api.paperStart(list, 60, true, {
-        enable_fno: enableFno,
-        trade_type: 'SWING',
-        trade_types: tradeTypes,
+        enable_fno: useFno || enableFno,
+        trade_type: products.includes('SWING') ? 'SWING' : products[0],
+        trade_types: styleIds ? undefined : products,
         style_ids: styleIds,
       })
-      const styleLabel =
-        scanStyle === 'auto'
-          ? 'regime selector'
-          : scanStyle === 'all'
-            ? 'all trading styles'
-            : `style: ${styleGroups.find((g) => g.id === scanStyle)?.name || scanStyle}`
-      setStatus(
-        enableFno
-          ? `Paper session STARTED — Stocks + F&O · ${styleLabel}`
-          : `Paper session STARTED — equity · ${styleLabel}`,
-      )
+      setStatus(`Paper session STARTED — ${products.join('+')} · ${styleLabelForStatus()}`)
       await refresh()
     } catch (err) {
       setStatus(`Start failed: ${(err as Error).message}`)
@@ -585,29 +598,20 @@ export default function App() {
   const runScan = async () => {
     setBusy(true)
     const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
-    // Product dropdown is the source of truth for Scan (checkbox is kept in sync).
-    const useFno = scanProduct === 'ALL'
-    const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
+    const products = scanProducts.length ? scanProducts : ['SWING']
+    const useFno = products.some((p) => p === 'FUTURES' || p === 'OPTIONS')
     const styleIds = styleIdsForRequest()
-    const styleLabel =
-      scanStyle === 'auto'
-        ? ''
-        : scanStyle === 'all'
-          ? ' · all trading styles'
-          : ` · ${styleGroups.find((g) => g.id === scanStyle)?.name || scanStyle}`
+    const styleLabel = ` · ${styleLabelForStatus()}`
     setStatus(
       huntMarket
-        ? `AI hunting market opportunities across universe, then processing via strategies${styleLabel}…`
-        : useFno
-          ? `Scanning Stocks + F&O${styleLabel}…`
-          : scanProduct === 'SWING'
-            ? `Scanning Stocks only${styleLabel}…`
-            : `Scanning ${scanProduct} only${styleLabel}…`,
+        ? `AI hunting market · products ${products.join('+')}${styleLabel}…`
+        : `Scanning ${products.join('+')}${styleLabel}…`,
     )
     try {
       const res = await api.scan(list, {
         enable_fno: useFno,
-        trade_type: product,
+        trade_type: products.includes('SWING') ? 'SWING' : products[0],
+        trade_types: products,
         hunt_market: huntMarket,
         top_n: 8,
         style_ids: styleIds,
@@ -679,17 +683,61 @@ export default function App() {
     }
   }
 
-  const executeSelected = async () => {
+  const executeSelected = async (force = false) => {
     if (!selected) return
     setBusy(true)
     setStatus(`Executing ${selected.symbol} ${selected.trade_type} (paper)…`)
     try {
-      const res = await api.execute(selected.symbol, selected.trade_type)
+      const res = await api.execute(selected.symbol, selected.trade_type, {
+        side: selected.side,
+        entry: selected.entry,
+        stop_loss: selected.stop_loss,
+        target_1: selected.target_1,
+        target_2: selected.target_2,
+        quantity: selected.quantity,
+        reason: selected.reason,
+        market_direction: selected.market_direction,
+        force: force || !selected.valid,
+      })
       setStatus(`${res.status}: ${res.message}`)
       setSelected(res.recommendation)
       await refresh()
     } catch (err) {
       setStatus(`Execute failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const placeFnoOrder = async (opts: {
+    product: 'FUTURES' | 'OPTIONS'
+    option_type?: string
+    strike?: number
+    entry?: number
+  }) => {
+    const sym = (searchSymbol || selected?.symbol || 'NIFTY').toUpperCase()
+    setBusy(true)
+    setStatus(`Placing paper ${opts.product} on ${sym}…`)
+    try {
+      const res = await api.fnoPlace({
+        symbol: sym,
+        product: opts.product,
+        side: 'BUY',
+        quantity: 1,
+        option_type: opts.option_type,
+        strike: opts.strike,
+        expiry: selectedExpiry || undefined,
+        entry: opts.entry,
+        auto_levels: true,
+        reason: 'Dashboard F&O place',
+      })
+      setStatus(
+        `${res.status}: ${opts.product} ${sym} entry ${res.levels.entry} SL ${res.levels.stop_loss} T1 ${res.levels.target_1}`,
+      )
+      if (res.recommendation) setSelected(res.recommendation)
+      await refresh()
+    } catch (err) {
+      setStatus(`F&O place failed: ${(err as Error).message}`)
     } finally {
       setBusy(false)
     }
@@ -1038,6 +1086,45 @@ export default function App() {
                   <p className="empty" style={{ marginBottom: '0.5rem' }}>
                     {optionChain.note}
                   </p>
+                  <div className="actions" style={{ marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.4rem' }}>
+                    <button
+                      className="btn primary"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void placeFnoOrder({ product: 'FUTURES' })}
+                    >
+                      Buy Futures (auto SL/T1)
+                    </button>
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void placeFnoOrder({
+                          product: 'OPTIONS',
+                          option_type: 'CE',
+                          strike: optionChain.atm_strike,
+                        })
+                      }
+                    >
+                      Buy ATM CE
+                    </button>
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void placeFnoOrder({
+                          product: 'OPTIONS',
+                          option_type: 'PE',
+                          strike: optionChain.atm_strike,
+                        })
+                      }
+                    >
+                      Buy ATM PE
+                    </button>
+                    <span className="chip">Places paper order with stop-loss + targets + lot margin</span>
+                  </div>
                   <div style={{ overflowX: 'auto' }}>
                     <table className="table option-chain">
                       <thead>
@@ -1046,7 +1133,7 @@ export default function App() {
                             CALL (CE)
                           </th>
                           <th style={{ textAlign: 'center' }}>Strike</th>
-                          <th colSpan={4} style={{ textAlign: 'center', color: 'var(--amber)' }}>
+                          <th colSpan={5} style={{ textAlign: 'center', color: 'var(--amber)' }}>
                             PUT (PE)
                           </th>
                         </tr>
@@ -1054,9 +1141,9 @@ export default function App() {
                           <th>OI</th>
                           <th>Vol</th>
                           <th>IV%</th>
-                          <th>LTP</th>
+                          <th>LTP / Buy</th>
                           <th>Strike</th>
-                          <th>LTP</th>
+                          <th>LTP / Buy</th>
                           <th>IV%</th>
                           <th>Vol</th>
                           <th>OI</th>
@@ -1073,14 +1160,50 @@ export default function App() {
                             <td>{(row.call?.oi ?? 0).toLocaleString('en-IN')}</td>
                             <td>{(row.call?.volume ?? 0).toLocaleString('en-IN')}</td>
                             <td>{(row.call?.iv ?? 0).toFixed(1)}</td>
-                            <td className="pos">{inrDec(row.call?.ltp ?? 0)}</td>
+                            <td className="pos">
+                              {inrDec(row.call?.ltp ?? 0)}{' '}
+                              <button
+                                type="button"
+                                className="chip"
+                                style={{ cursor: 'pointer', border: 'none', padding: '0.1rem 0.35rem' }}
+                                disabled={busy}
+                                onClick={() =>
+                                  void placeFnoOrder({
+                                    product: 'OPTIONS',
+                                    option_type: 'CE',
+                                    strike: row.strike,
+                                    entry: row.call?.ltp,
+                                  })
+                                }
+                              >
+                                CE
+                              </button>
+                            </td>
                             <td>
                               <strong>
                                 {row.strike}
                                 {row.is_atm ? ' · ATM' : ''}
                               </strong>
                             </td>
-                            <td className="neg">{inrDec(row.put?.ltp ?? 0)}</td>
+                            <td className="neg">
+                              {inrDec(row.put?.ltp ?? 0)}{' '}
+                              <button
+                                type="button"
+                                className="chip"
+                                style={{ cursor: 'pointer', border: 'none', padding: '0.1rem 0.35rem' }}
+                                disabled={busy}
+                                onClick={() =>
+                                  void placeFnoOrder({
+                                    product: 'OPTIONS',
+                                    option_type: 'PE',
+                                    strike: row.strike,
+                                    entry: row.put?.ltp,
+                                  })
+                                }
+                              >
+                                PE
+                              </button>
+                            </td>
                             <td>{(row.put?.iv ?? 0).toFixed(1)}</td>
                             <td>{(row.put?.volume ?? 0).toLocaleString('en-IN')}</td>
                             <td>{(row.put?.oi ?? 0).toLocaleString('en-IN')}</td>
@@ -1374,6 +1497,44 @@ export default function App() {
                     <p className="empty" style={{ marginBottom: '0.5rem' }}>
                       {optionChain.note}
                     </p>
+                    <div className="actions" style={{ marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.4rem' }}>
+                      <button
+                        className="btn primary"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void placeFnoOrder({ product: 'FUTURES' })}
+                      >
+                        Buy Futures (auto SL/T1)
+                      </button>
+                      <button
+                        className="btn"
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          void placeFnoOrder({
+                            product: 'OPTIONS',
+                            option_type: 'CE',
+                            strike: optionChain.atm_strike,
+                          })
+                        }
+                      >
+                        Buy ATM CE
+                      </button>
+                      <button
+                        className="btn"
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          void placeFnoOrder({
+                            product: 'OPTIONS',
+                            option_type: 'PE',
+                            strike: optionChain.atm_strike,
+                          })
+                        }
+                      >
+                        Buy ATM PE
+                      </button>
+                    </div>
                     <div style={{ overflowX: 'auto' }}>
                       <table className="table option-chain">
                         <thead>
@@ -1409,14 +1570,50 @@ export default function App() {
                               <td>{(row.call?.oi ?? 0).toLocaleString('en-IN')}</td>
                               <td>{(row.call?.volume ?? 0).toLocaleString('en-IN')}</td>
                               <td>{(row.call?.iv ?? 0).toFixed(1)}</td>
-                              <td className="pos">{inrDec(row.call?.ltp ?? 0)}</td>
+                              <td className="pos">
+                                {inrDec(row.call?.ltp ?? 0)}{' '}
+                                <button
+                                  type="button"
+                                  className="chip"
+                                  style={{ cursor: 'pointer', border: 'none', padding: '0.1rem 0.35rem' }}
+                                  disabled={busy}
+                                  onClick={() =>
+                                    void placeFnoOrder({
+                                      product: 'OPTIONS',
+                                      option_type: 'CE',
+                                      strike: row.strike,
+                                      entry: row.call?.ltp,
+                                    })
+                                  }
+                                >
+                                  CE
+                                </button>
+                              </td>
                               <td>
                                 <strong>
                                   {row.strike}
                                   {row.is_atm ? ' · ATM' : ''}
                                 </strong>
                               </td>
-                              <td className="neg">{inrDec(row.put?.ltp ?? 0)}</td>
+                              <td className="neg">
+                                {inrDec(row.put?.ltp ?? 0)}{' '}
+                                <button
+                                  type="button"
+                                  className="chip"
+                                  style={{ cursor: 'pointer', border: 'none', padding: '0.1rem 0.35rem' }}
+                                  disabled={busy}
+                                  onClick={() =>
+                                    void placeFnoOrder({
+                                      product: 'OPTIONS',
+                                      option_type: 'PE',
+                                      strike: row.strike,
+                                      entry: row.put?.ltp,
+                                    })
+                                  }
+                                >
+                                  PE
+                                </button>
+                              </td>
                               <td>{(row.put?.iv ?? 0).toFixed(1)}</td>
                               <td>{(row.put?.volume ?? 0).toLocaleString('en-IN')}</td>
                               <td>{(row.put?.oi ?? 0).toLocaleString('en-IN')}</td>
@@ -1886,7 +2083,7 @@ export default function App() {
                 <button className="btn primary" disabled={busy} onClick={runScan}>
                   {huntMarket ? 'Hunt Market' : 'Scan'}
                 </button>
-                <button className="btn" disabled={busy || !selected} onClick={executeSelected}>
+                <button className="btn" disabled={busy || !selected} onClick={() => void executeSelected()}>
                   Execute Paper
                 </button>
               </div>
@@ -1908,41 +2105,67 @@ export default function App() {
                 />
                 AI market hunt (discover symbols → strategies / styles)
               </label>
-              <label className="chip" style={{ cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={scanProduct === 'ALL' || enableFno}
-                  onChange={(e) => {
-                    const on = e.target.checked
-                    setEnableFno(on)
-                    setScanProduct(on ? 'ALL' : 'SWING')
+            </div>
+            <div className="chips" style={{ marginTop: '0.55rem' }}>
+              <span style={{ color: 'var(--muted)', fontSize: '0.8rem', marginRight: 4 }}>Products</span>
+              {PRODUCT_OPTIONS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className="chip"
+                  onClick={() => toggleProduct(p.id)}
+                  style={{
+                    cursor: 'pointer',
+                    border: 'none',
+                    background: scanProducts.includes(p.id) ? 'var(--teal-dim)' : undefined,
+                    color: scanProducts.includes(p.id) ? 'var(--teal)' : undefined,
                   }}
-                  style={{ marginRight: '0.4rem' }}
-                />
-                Include F&amp;O (Futures + Options)
-              </label>
-              <select
-                value={scanProduct}
-                onChange={(e) => {
-                  const v = e.target.value as typeof scanProduct
-                  setScanProduct(v)
-                  setEnableFno(v === 'ALL' || v === 'FUTURES' || v === 'OPTIONS')
+                >
+                  {scanProducts.includes(p.id) ? '✓ ' : ''}
+                  {p.label}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="chip"
+                style={{ cursor: 'pointer', border: 'none' }}
+                onClick={() => {
+                  setScanProducts(['SWING', 'INTRADAY', 'FUTURES', 'OPTIONS'])
+                  setEnableFno(true)
                 }}
-                aria-label="Product"
               >
-                <option value="ALL">All products</option>
-                <option value="SWING">Stocks only</option>
-                <option value="FUTURES">Futures only</option>
-                <option value="OPTIONS">Options only</option>
-              </select>
+                All
+              </button>
+            </div>
+            <div className="scan-row" style={{ marginTop: '0.55rem', alignItems: 'flex-start' }}>
+              <label style={{ color: 'var(--muted)', fontSize: '0.8rem', minWidth: 48, paddingTop: 6 }}>Styles</label>
               <select
-                value={scanStyle}
-                onChange={(e) => setScanStyle(e.target.value)}
-                aria-label="Trading style"
-                title="Trading style (Scalping → ETF investing)"
+                multiple
+                size={6}
+                value={scanStyles}
+                onChange={(e) => {
+                  const vals = Array.from(e.target.selectedOptions).map((o) => o.value)
+                  if (!vals.length) {
+                    setScanStyles(['all'])
+                    return
+                  }
+                  // Exclusive shortcuts
+                  if (vals.includes('all') && !scanStyles.includes('all')) {
+                    setScanStyles(['all'])
+                    return
+                  }
+                  if (vals.includes('auto') && !scanStyles.includes('auto')) {
+                    setScanStyles(['auto'])
+                    return
+                  }
+                  setScanStyles(vals.filter((v) => v !== 'all' && v !== 'auto'))
+                }}
+                aria-label="Trading styles (multi-select)"
+                title="Hold Ctrl/Cmd to multi-select styles"
+                style={{ minWidth: 260, maxWidth: '100%', flex: 1 }}
               >
-                <option value="auto">Style: Auto (regime)</option>
-                <option value="all">Style: All styles</option>
+                <option value="auto">Auto (regime)</option>
+                <option value="all">All styles</option>
                 {styleGroups.map((g) => (
                   <option key={g.id} value={g.id}>
                     {g.name}
@@ -1950,6 +2173,9 @@ export default function App() {
                 ))}
               </select>
             </div>
+            <p className="prose" style={{ marginTop: '0.35rem', fontSize: '0.75rem' }}>
+              Multi-select products above. Styles: Ctrl/Cmd+click. F&amp;O (Futures/Options) includes SL, targets, lots, expiry/CE-PE on F&amp;O desk.
+            </p>
             {huntMeta && <p className="prose" style={{ marginTop: '0.5rem' }}>{huntMeta}</p>}
             {hunted.length > 0 && (
               <div style={{ overflowX: 'auto', marginTop: '0.75rem', marginBottom: '0.75rem' }}>
@@ -2114,6 +2340,31 @@ export default function App() {
                   <ScoreBar label="Volatility" value={selected.scores.volatility_score} risk />
                 </div>
 
+                <div className="actions" style={{ marginTop: '0.75rem', flexWrap: 'wrap', gap: '0.4rem' }}>
+                  <button
+                    className="btn primary"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void executeSelected(false)}
+                  >
+                    Execute with SL / Targets
+                  </button>
+                  {!selected.valid && (
+                    <button
+                      className="btn warn"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void executeSelected(true)}
+                      title="Paper override — places using shown entry/SL/targets"
+                    >
+                      Force Paper Place
+                    </button>
+                  )}
+                  {(selected.trade_type === 'FUTURES' || selected.trade_type === 'OPTIONS') && (
+                    <span className="chip">F&amp;O · lot qty · SL · T1/T2 · margin check</span>
+                  )}
+                </div>
+
                 <p className="prose">
                   <strong>Reason.</strong> {selected.reason}
                 </p>
@@ -2188,23 +2439,74 @@ export default function App() {
             <label className="chip" style={{ display: 'inline-flex', marginTop: '0.75rem', cursor: paperRunning ? 'not-allowed' : 'pointer' }}>
               <input
                 type="checkbox"
-                checked={enableFno}
+                checked={enableFno || scanProducts.some((p) => p === 'FUTURES' || p === 'OPTIONS')}
                 disabled={paperRunning}
-                onChange={(e) => setEnableFno(e.target.checked)}
+                onChange={(e) => {
+                  const on = e.target.checked
+                  setEnableFno(on)
+                  if (on) {
+                    setScanProducts((prev) => {
+                      const next = new Set(prev)
+                      next.add('FUTURES')
+                      next.add('OPTIONS')
+                      return Array.from(next)
+                    })
+                  } else {
+                    setScanProducts((prev) => prev.filter((p) => p !== 'FUTURES' && p !== 'OPTIONS'))
+                  }
+                }}
                 style={{ marginRight: '0.4rem' }}
               />
               Auto-trade F&amp;O with Stocks
             </label>
+            <div className="chips" style={{ marginTop: '0.55rem' }}>
+              {PRODUCT_OPTIONS.map((p) => (
+                <button
+                  key={`paper-prod-${p.id}`}
+                  type="button"
+                  className="chip"
+                  disabled={paperRunning}
+                  onClick={() => toggleProduct(p.id)}
+                  style={{
+                    cursor: paperRunning ? 'not-allowed' : 'pointer',
+                    border: 'none',
+                    background: scanProducts.includes(p.id) ? 'var(--teal-dim)' : undefined,
+                    color: scanProducts.includes(p.id) ? 'var(--teal)' : undefined,
+                  }}
+                >
+                  {scanProducts.includes(p.id) ? '✓ ' : ''}
+                  {p.label}
+                </button>
+              ))}
+            </div>
             <div className="scan-row" style={{ marginTop: '0.65rem' }}>
               <select
-                value={scanStyle}
+                multiple
+                size={5}
+                value={scanStyles}
                 disabled={paperRunning}
-                onChange={(e) => setScanStyle(e.target.value)}
-                aria-label="Paper trading style"
-                title="Paper agent trading style"
+                onChange={(e) => {
+                  const vals = Array.from(e.target.selectedOptions).map((o) => o.value)
+                  if (!vals.length) {
+                    setScanStyles(['all'])
+                    return
+                  }
+                  if (vals.includes('all') && !scanStyles.includes('all')) {
+                    setScanStyles(['all'])
+                    return
+                  }
+                  if (vals.includes('auto') && !scanStyles.includes('auto')) {
+                    setScanStyles(['auto'])
+                    return
+                  }
+                  setScanStyles(vals.filter((v) => v !== 'all' && v !== 'auto'))
+                }}
+                aria-label="Paper trading styles"
+                title="Multi-select trading styles"
+                style={{ minWidth: 240, width: '100%' }}
               >
-                <option value="auto">Style: Auto (regime)</option>
-                <option value="all">Style: All styles (Scalping→ETF)</option>
+                <option value="auto">Auto (regime)</option>
+                <option value="all">All styles (Scalping→ETF)</option>
                 {styleGroups.map((g) => (
                   <option key={`paper-${g.id}`} value={g.id}>
                     {g.name}
@@ -2213,8 +2515,7 @@ export default function App() {
               </select>
             </div>
             <p className="prose" style={{ marginTop: '0.4rem', fontSize: '0.8rem' }}>
-              Agent can run Scalping, Intraday, Momentum, Swing, Position, Trend, Breakout, Mean Reversion,
-              Options/Futures, Arbitrage, Pair, Event/News, Quant/Algo, and long-term investing styles when selected.
+              Agent runs selected products + styles. F&amp;O orders use stop-loss, targets, lot sizing, and margin checks.
             </p>
 
             <div className="panel-head" style={{ marginTop: '1rem' }}>

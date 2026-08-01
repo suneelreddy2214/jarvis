@@ -13,7 +13,13 @@ from pydantic import BaseModel, Field
 
 from quantx import __version__
 from quantx.analysis.backtest import Backtester
-from quantx.analysis.fno import DEFAULT_FO_UNIVERSE, is_index
+from quantx.analysis.fno import (
+    DEFAULT_FO_UNIVERSE,
+    encode_fo_meta,
+    is_index,
+    paper_option_levels,
+    paper_option_premium,
+)
 from quantx.analysis.option_chain import FnoSearchService, SEARCH_UNIVERSE
 from quantx.analysis.strategies import list_strategies
 import quantx.analysis.additional_strategies  # noqa: F401 — register additive strategies
@@ -32,7 +38,13 @@ from quantx.core.config import get_settings
 from quantx.core.emergency import EmergencyController
 from quantx.core.engine import QuantXEngine
 from quantx.core.market_hours import MarketClock
-from quantx.core.models import TradeType
+from quantx.core.models import (
+    AIScores,
+    MarketDirection,
+    Side,
+    TradeRecommendation,
+    TradeType,
+)
 from quantx.data.market_data import DEFAULT_WATCHLIST, MarketDataService
 from quantx.execution.base import PaperBrokerAdapter, broker_credentials_present
 from quantx.execution.broker import PaperBroker
@@ -193,6 +205,7 @@ class ScanRequest(BaseModel):
     symbols: list[str] = Field(default_factory=lambda: list(DEFAULT_PAPER_UNIVERSE)[:8])
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
+    trade_types: Optional[list[str]] = None  # multi-select: SWING/INTRADAY/FUTURES/OPTIONS
     strategy: Optional[str] = None
     enable_fno: bool = False
     fo_symbols: Optional[list[str]] = None
@@ -208,6 +221,7 @@ class HuntRequest(BaseModel):
     exchange: str = "NSE"
     enable_fno: bool = True
     trade_type: str = "ALL"
+    trade_types: Optional[list[str]] = None
     style_ids: Optional[list[str]] = None
     min_score: float = 52.0
     strategies_per_product: int = 2
@@ -218,6 +232,35 @@ class ExecuteRequest(BaseModel):
     exchange: str = "NSE"
     trade_type: TradeType = TradeType.SWING
     strategy: Optional[str] = None
+    # When set, execute this recommendation as-is (preserves SL/target from scan)
+    side: Optional[str] = None
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_1: Optional[float] = None
+    target_2: Optional[float] = None
+    quantity: Optional[int] = None
+    reason: Optional[str] = None
+    market_direction: Optional[str] = None
+    force: bool = False  # paper operator override — place even if gates rejected setup
+
+
+class FnoPlaceRequest(BaseModel):
+    """Manual F&O paper order with stop-loss / targets."""
+
+    symbol: str  # underlying
+    exchange: str = "NSE"
+    product: str = "FUTURES"  # FUTURES | OPTIONS
+    side: str = "BUY"
+    quantity: int = 1  # lots
+    option_type: Optional[str] = None  # CE | PE
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_1: Optional[float] = None
+    target_2: Optional[float] = None
+    auto_levels: bool = True
+    reason: str = "Manual F&O paper order"
 
 
 class CloseRequest(BaseModel):
@@ -281,6 +324,40 @@ class LLMConfigRequest(BaseModel):
     api_key: str = ""
     provider: str = "groq"  # openai | groq | openrouter
     model: str = ""
+
+
+def _normalize_trade_types(
+    trade_types: Optional[list[str]],
+    *,
+    trade_type: str | TradeType = "SWING",
+    enable_fno: bool = False,
+) -> list[str]:
+    """Resolve multi-select products; empty → derive from trade_type / F&O flag."""
+    allowed = {"SWING", "INTRADAY", "FUTURES", "OPTIONS"}
+    if trade_types:
+        out: list[str] = []
+        for t in trade_types:
+            key = str(t).upper().strip()
+            if key in ("STOCKS", "EQUITY", "CASH"):
+                key = "SWING"
+            if key in allowed and key not in out:
+                out.append(key)
+        if out:
+            return out
+    tt = trade_type.value if isinstance(trade_type, TradeType) else str(trade_type).upper()
+    if enable_fno or tt == "ALL":
+        return ["SWING", "INTRADAY", "FUTURES", "OPTIONS"]
+    if tt in allowed:
+        # Stocks-only still includes intraday equity by default
+        return [tt] if tt != "SWING" else ["SWING", "INTRADAY"]
+    return ["SWING", "INTRADAY"]
+
+
+def _normalize_style_ids(style_ids: Optional[list[str]]) -> Optional[list[str]]:
+    """Expand 'all' / aliases into concrete catalog ids so hunt never gets 0 strategies."""
+    if style_ids is None:
+        return None
+    return [s.id for s in resolve_style_ids(style_ids)]
 
 
 @app.get("/api/health")
@@ -458,31 +535,51 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/api/scan")
 def scan(req: ScanRequest):
+    products = _normalize_trade_types(
+        req.trade_types,
+        trade_type=req.trade_type,
+        enable_fno=req.enable_fno,
+    )
+    enable_fno = req.enable_fno or any(t in ("FUTURES", "OPTIONS") for t in products)
+    style_ids = _normalize_style_ids(req.style_ids)
+
     # AI market hunt: discover opportunistic symbols then process via strategies/styles
     if req.hunt_market:
         hunter = OpportunityHunter(engine=engine, market_data=market_data, db=db)
-        tt = req.trade_type.value if isinstance(req.trade_type, TradeType) else str(req.trade_type)
-        # Default hunt uses all trading styles when none specified
-        style_ids = req.style_ids if req.style_ids is not None else [s.id for s in resolve_style_ids(None)]
+        hunt_styles = style_ids if style_ids is not None else [s.id for s in resolve_style_ids(None)]
         result = hunter.hunt_and_process(
             seed_symbols=req.symbols,
             top_n=req.top_n,
             exchange=req.exchange,
-            enable_fno=req.enable_fno or tt == "ALL",
-            trade_type="ALL" if req.enable_fno else tt,
-            style_ids=style_ids,
+            enable_fno=enable_fno,
+            trade_type="ALL" if set(products) >= {"SWING", "FUTURES", "OPTIONS"} else products[0],
+            trade_types=products,
+            style_ids=hunt_styles,
             min_score=req.min_hunt_score,
         )
         return result
 
     # Style-driven scan (Scalping → ETF investing, etc.)
-    if req.style_ids is not None:
-        tt = req.trade_type.value if isinstance(req.trade_type, TradeType) else str(req.trade_type)
-        if req.enable_fno or tt == "ALL":
-            product_filter = ["SWING", "INTRADAY", "FUTURES", "OPTIONS"]
-        else:
-            product_filter = [tt]
-        jobs = style_strategy_jobs(req.style_ids, trade_type_filter=product_filter, limit_per_style=4)
+    if style_ids is not None:
+        jobs = style_strategy_jobs(style_ids, trade_type_filter=products, limit_per_style=4)
+        # Hard fallback so UI never shows "0 strategies"
+        if not jobs:
+            for tt in products:
+                fallback = {
+                    "FUTURES": ("futures", "Futures Trading", "Intraday to weeks", "futures_trend"),
+                    "OPTIONS": ("options", "Options Trading", "Intraday to expiry", "options_directional"),
+                    "INTRADAY": ("intraday", "Intraday (Day Trading)", "Minutes to hours", "intraday_momentum"),
+                    "SWING": ("swing", "Swing Trading", "2–30 days", "swing_trend"),
+                }[tt]
+                jobs.append(
+                    {
+                        "style_id": fallback[0],
+                        "style_name": fallback[1],
+                        "holding_period": fallback[2],
+                        "strategy": fallback[3],
+                        "trade_type": tt,
+                    }
+                )
         fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
         equity_syms = [s for s in req.symbols if not is_index(s)] or list(req.symbols)
         results = []
@@ -495,7 +592,6 @@ def scan(req: ScanRequest):
             try:
                 batch = engine.scan_watchlist(syms, req.exchange, trade_type, strategy=job["strategy"])
                 for r in batch:
-                    # Tag trading style on the recommendation for UI
                     r.supporting_indicators = list(r.supporting_indicators or []) + [
                         f"style:{job['style_id']}",
                         f"holding:{job['holding_period']}",
@@ -518,7 +614,6 @@ def scan(req: ScanRequest):
             except Exception as e:
                 logger.exception("Style scan failed %s/%s: %s", job["style_id"], job["strategy"], e)
 
-        # Dedupe symbol+product keep highest confidence
         best = {}
         for r in results:
             key = (r.symbol, r.trade_type.value)
@@ -532,44 +627,56 @@ def scan(req: ScanRequest):
         return {
             "count": len(results),
             "valid_count": sum(1 for r in results if r.valid),
-            "enable_fno": req.enable_fno,
+            "enable_fno": enable_fno,
             "mode": "trading_styles",
+            "trade_types": products,
             "hunted_symbols": req.symbols,
             "strategies_used": strategies_used,
             "styles_touched": styles_touched,
             "jobs_run": len(jobs),
             "recommendations": [r.model_dump(mode="json") for r in results],
-            "message": f"Scanned {len(styles_touched)} trading style(s) / {len(jobs)} strategy jobs",
+            "message": (
+                f"Scanned {len(styles_touched)} trading style(s) / {len(jobs)} strategy jobs "
+                f"· products {','.join(products)}"
+            ),
         }
 
     results = []
-    if req.enable_fno:
-        # Stocks + Futures + Options in one pass
-        equity = engine.scan_watchlist(req.symbols, req.exchange, TradeType.SWING, strategy=req.strategy)
-        fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
-        futs = engine.scan_watchlist(fo_syms, req.exchange, TradeType.FUTURES, strategy="futures_trend")
-        opts = engine.scan_watchlist(fo_syms, req.exchange, TradeType.OPTIONS, strategy="options_directional")
-        # Also include intraday when doing all-products
-        intra = engine.scan_watchlist(req.symbols, req.exchange, TradeType.INTRADAY, strategy="intraday_momentum")
-        results = equity + intra + futs + opts
-        results.sort(key=lambda r: (not r.valid, -r.scores.confidence))
-    else:
-        strat = req.strategy
-        if not strat:
-            if req.trade_type == TradeType.FUTURES:
-                strat = "futures_trend"
-            elif req.trade_type == TradeType.OPTIONS:
-                strat = "options_directional"
-            elif req.trade_type == TradeType.INTRADAY:
-                strat = "intraday_momentum"
-        results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type, strategy=strat)
+    fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
+    for tt in products:
+        try:
+            syms = fo_syms if tt in ("FUTURES", "OPTIONS") else req.symbols
+            strat = req.strategy
+            if not strat:
+                strat = {
+                    "FUTURES": "futures_trend",
+                    "OPTIONS": "options_directional",
+                    "INTRADAY": "intraday_momentum",
+                    "SWING": "swing_trend",
+                }.get(tt)
+            batch = engine.scan_watchlist(syms, req.exchange, TradeType(tt), strategy=strat)
+            results.extend(batch)
+        except Exception as e:
+            logger.exception("Product scan failed %s: %s", tt, e)
+    best = {}
+    for r in results:
+        key = (r.symbol, r.trade_type.value)
+        prev = best.get(key)
+        if prev is None or (r.valid and not prev.valid) or (
+            r.valid == prev.valid and r.scores.confidence > prev.scores.confidence
+        ):
+            best[key] = r
+    results = list(best.values())
+    results.sort(key=lambda r: (not r.valid, -r.scores.confidence))
     return {
         "count": len(results),
         "valid_count": sum(1 for r in results if r.valid),
-        "enable_fno": req.enable_fno,
-        "mode": "watchlist",
+        "enable_fno": enable_fno,
+        "mode": "products",
+        "trade_types": products,
         "hunted_symbols": req.symbols,
         "recommendations": [r.model_dump(mode="json") for r in results],
+        "message": f"Scanned products {','.join(products)} · {sum(1 for r in results if r.valid)}/{len(results)} actionable",
     }
 
 
@@ -577,14 +684,21 @@ def scan(req: ScanRequest):
 def hunt_market(req: HuntRequest):
     """Go to market, hunt opportunistic symbols, process with strategies/trading styles."""
     hunter = OpportunityHunter(engine=engine, market_data=market_data, db=db)
+    products = _normalize_trade_types(
+        req.trade_types,
+        trade_type=req.trade_type,
+        enable_fno=req.enable_fno,
+    )
+    style_ids = _normalize_style_ids(req.style_ids)
     try:
         return hunter.hunt_and_process(
             seed_symbols=req.seed_symbols,
             top_n=req.top_n,
             exchange=req.exchange,
-            enable_fno=req.enable_fno,
+            enable_fno=req.enable_fno or any(t in ("FUTURES", "OPTIONS") for t in products),
             trade_type=req.trade_type,
-            style_ids=req.style_ids,
+            trade_types=products,
+            style_ids=style_ids if style_ids is not None else [s.id for s in resolve_style_ids(None)],
             min_score=req.min_score,
             strategies_per_product=req.strategies_per_product,
         )
@@ -604,15 +718,175 @@ def hunt_universe():
 
 @app.post("/api/execute")
 def execute(req: ExecuteRequest):
+    """Execute paper order — prefers scanned recommendation levels (entry/SL/targets)."""
+    if req.entry is not None and req.stop_loss is not None and req.target_1 is not None and req.side:
+        try:
+            side = Side(req.side.upper())
+        except Exception as e:
+            raise HTTPException(400, f"Invalid side: {e}")
+        try:
+            direction = MarketDirection(req.market_direction) if req.market_direction else MarketDirection.NEUTRAL
+        except Exception:
+            direction = MarketDirection.NEUTRAL
+        qty = int(req.quantity or 0)
+        if qty <= 0:
+            raise HTTPException(400, "quantity must be > 0 when placing from recommendation")
+        rec = TradeRecommendation(
+            symbol=req.symbol.upper(),
+            exchange=req.exchange,
+            market_direction=direction,
+            trade_type=req.trade_type,
+            side=side,
+            entry=float(req.entry),
+            stop_loss=float(req.stop_loss),
+            target_1=float(req.target_1),
+            target_2=float(req.target_2 if req.target_2 is not None else req.target_1),
+            risk_reward=round(abs(float(req.target_1) - float(req.entry)) / max(abs(float(req.entry) - float(req.stop_loss)), 1e-6), 2),
+            quantity=qty,
+            capital_at_risk=abs(float(req.entry) - float(req.stop_loss)) * qty,
+            scores=AIScores(
+                confidence=70 if req.force else 65,
+                risk_score=40,
+                volatility_score=50,
+                probability_of_success=60,
+            ),
+            reason=req.reason or f"Dashboard execute {req.trade_type.value}",
+            valid=True,
+            rejection_reason=None,
+        )
+        if req.force:
+            rec.supporting_indicators = ["operator_force"]
+        result = broker.retry_safe(rec)
+        result["recommendation"] = rec.model_dump(mode="json")
+        return result
+
     strat = req.strategy
     if not strat:
         if req.trade_type == TradeType.FUTURES:
             strat = "futures_trend"
         elif req.trade_type == TradeType.OPTIONS:
             strat = "options_directional"
+        elif req.trade_type == TradeType.INTRADAY:
+            strat = "intraday_momentum"
     rec = engine.analyze_symbol(req.symbol, req.exchange, req.trade_type, strategy=strat)
+    if req.force and not rec.valid and rec.quantity > 0 and rec.entry > 0:
+        rec.valid = True
+        rec.rejection_reason = None
+        rec.reason = (rec.reason or "") + " [operator force]"
     result = broker.retry_safe(rec)
     result["recommendation"] = rec.model_dump(mode="json")
+    return result
+
+
+@app.post("/api/fno/place")
+def fno_place(req: FnoPlaceRequest):
+    """Place paper Futures/Options order with stop-loss and targets."""
+    if settings.agent.mode != "paper":
+        raise HTTPException(400, "F&O place is paper-only in this build")
+    product = req.product.upper().strip()
+    if product not in ("FUTURES", "OPTIONS"):
+        raise HTTPException(400, "product must be FUTURES or OPTIONS")
+    try:
+        side = Side(req.side.upper())
+    except Exception as e:
+        raise HTTPException(400, f"Invalid side: {e}")
+    if req.quantity <= 0:
+        raise HTTPException(400, "quantity (lots) must be > 0")
+
+    symbol = req.symbol.upper().replace(".NS", "").replace(".BO", "")
+    try:
+        quote = market_data.get_quote(symbol, req.exchange)
+        spot = float(quote["price"])
+    except Exception as e:
+        raise HTTPException(400, f"Quote unavailable for {symbol}: {e}")
+
+    atr = 0.0
+    try:
+        df = market_data.get_ohlc(symbol, req.exchange, period="3mo")
+        snap = engine.ta.analyze(df)
+        atr = float(snap.atr or 0)
+        direction = snap.trend if snap.trend else MarketDirection.NEUTRAL
+    except Exception:
+        direction = MarketDirection.BULLISH if side == Side.BUY else MarketDirection.BEARISH
+
+    entry = float(req.entry) if req.entry is not None else spot
+    stop = req.stop_loss
+    t1 = req.target_1
+    t2 = req.target_2
+    reason = req.reason
+    fo_meta = ""
+
+    if product == "OPTIONS":
+        kind = (req.option_type or ("CE" if side == Side.BUY else "PE")).upper()
+        if kind not in ("CE", "PE"):
+            raise HTTPException(400, "option_type must be CE or PE")
+        strike = float(req.strike) if req.strike is not None else round(spot / 50) * 50
+        if req.entry is None:
+            entry = paper_option_premium(spot, atr or spot * 0.01)
+        if req.auto_levels and (stop is None or t1 is None):
+            levels = paper_option_levels(entry)
+            stop = stop if stop is not None else levels["stop_loss"]
+            t1 = t1 if t1 is not None else levels["target_1"]
+            t2 = t2 if t2 is not None else levels["target_2"]
+        fo_meta = encode_fo_meta(spot, kind, strike, req.expiry)
+        reason = f"{reason} {fo_meta} {kind} strike={strike}"
+        order_side = Side.BUY  # paper long options only
+        trade_type = TradeType.OPTIONS
+    else:
+        # Futures: SL/target from ATR
+        if req.auto_levels and (stop is None or t1 is None):
+            stop_dist = max(atr * 1.5, entry * 0.008, 1.0)
+            if side == Side.BUY:
+                stop = stop if stop is not None else round(entry - stop_dist, 2)
+                t1 = t1 if t1 is not None else round(entry + 2 * stop_dist, 2)
+                t2 = t2 if t2 is not None else round(entry + 3 * stop_dist, 2)
+            else:
+                stop = stop if stop is not None else round(entry + stop_dist, 2)
+                t1 = t1 if t1 is not None else round(entry - 2 * stop_dist, 2)
+                t2 = t2 if t2 is not None else round(entry - 3 * stop_dist, 2)
+        if req.expiry:
+            reason = f"{reason} [FUT expiry={req.expiry}]"
+        order_side = side
+        trade_type = TradeType.FUTURES
+
+    if stop is None or t1 is None:
+        raise HTTPException(400, "stop_loss and target_1 required (or set auto_levels=true)")
+    stop = float(stop)
+    t1 = float(t1)
+    t2 = float(t2 if t2 is not None else t1)
+    risk = abs(entry - stop)
+    rr = round(abs(t1 - entry) / risk, 2) if risk > 0 else 0.0
+
+    rec = TradeRecommendation(
+        symbol=symbol,
+        exchange=req.exchange,
+        market_direction=direction,
+        trade_type=trade_type,
+        side=order_side,
+        entry=round(entry, 2),
+        stop_loss=round(stop, 2),
+        target_1=round(t1, 2),
+        target_2=round(t2, 2),
+        risk_reward=rr,
+        quantity=int(req.quantity),
+        capital_at_risk=round(risk * req.quantity, 2),
+        scores=AIScores(confidence=72, risk_score=45, volatility_score=55, probability_of_success=62),
+        reason=reason,
+        options_summary=fo_meta if product == "OPTIONS" else "",
+        supporting_indicators=["manual_fno", f"product:{product}"],
+        valid=True,
+    )
+    result = broker.retry_safe(rec)
+    result["recommendation"] = rec.model_dump(mode="json")
+    result["product"] = product
+    result["levels"] = {
+        "entry": rec.entry,
+        "stop_loss": rec.stop_loss,
+        "target_1": rec.target_1,
+        "target_2": rec.target_2,
+        "risk_reward": rec.risk_reward,
+        "quantity_lots": rec.quantity,
+    }
     return result
 
 

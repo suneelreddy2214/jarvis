@@ -215,6 +215,7 @@ export const api = {
     }),
   scan: (symbols: string[], opts: {
     trade_type?: string
+    trade_types?: string[]
     enable_fno?: boolean
     hunt_market?: boolean
     top_n?: number
@@ -227,6 +228,7 @@ export const api = {
       recommendations: TradeRecommendation[]
       enable_fno?: boolean
       mode?: string
+      trade_types?: string[]
       hunted?: Array<{
         symbol: string
         score: number
@@ -241,7 +243,7 @@ export const api = {
       hunted_symbols?: string[]
       universe_size?: number
       strategies_used?: Record<string, string[]>
-      styles_touched?: Array<{ id: string; name: string; ai_suitability?: number }>
+      styles_touched?: Array<{ id: string; name: string; ai_suitability?: number; holding_period?: string }>
       regime?: { regime?: string; summary?: string; preferred_families?: string[] }
       message?: string
     }>(
@@ -252,6 +254,7 @@ export const api = {
           symbols,
           exchange: 'NSE',
           trade_type: opts.trade_type || 'SWING',
+          trade_types: opts.trade_types,
           enable_fno: opts.enable_fno ?? false,
           hunt_market: opts.hunt_market ?? false,
           top_n: opts.top_n ?? 8,
@@ -296,11 +299,72 @@ export const api = {
         style_ids: opts.style_ids,
       }),
     }),
-  execute: (symbol: string, trade_type = 'SWING') =>
+  execute: (
+    symbol: string,
+    trade_type = 'SWING',
+    opts: {
+      strategy?: string
+      side?: string
+      entry?: number
+      stop_loss?: number
+      target_1?: number
+      target_2?: number
+      quantity?: number
+      reason?: string
+      market_direction?: string
+      force?: boolean
+    } = {},
+  ) =>
     req<{ status: string; message: string; recommendation: TradeRecommendation }>(
       '/api/execute',
-      { method: 'POST', body: JSON.stringify({ symbol, exchange: 'NSE', trade_type }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          symbol,
+          exchange: 'NSE',
+          trade_type,
+          strategy: opts.strategy,
+          side: opts.side,
+          entry: opts.entry,
+          stop_loss: opts.stop_loss,
+          target_1: opts.target_1,
+          target_2: opts.target_2,
+          quantity: opts.quantity,
+          reason: opts.reason,
+          market_direction: opts.market_direction,
+          force: opts.force ?? false,
+        }),
+      },
     ),
+  fnoPlace: (body: {
+    symbol: string
+    product: 'FUTURES' | 'OPTIONS'
+    side?: string
+    quantity?: number
+    option_type?: string
+    strike?: number
+    expiry?: string
+    entry?: number
+    stop_loss?: number
+    target_1?: number
+    target_2?: number
+    auto_levels?: boolean
+    reason?: string
+  }) =>
+    req<{
+      status: string
+      message: string
+      recommendation: TradeRecommendation
+      product: string
+      levels: {
+        entry: number
+        stop_loss: number
+        target_1: number
+        target_2: number
+        risk_reward: number
+        quantity_lots: number
+      }
+    }>('/api/fno/place', { method: 'POST', body: JSON.stringify(body) }),
   mark: () => req<{ positions: Position[]; portfolio: PortfolioSnapshot }>('/api/positions/mark', { method: 'POST' }),
   close: (position_id: number, reason = 'Manual close') =>
     req<Position>('/api/positions/close', {
