@@ -99,14 +99,28 @@ export default function App() {
   const [pnlData, setPnlData] = useState<Awaited<ReturnType<typeof api.pnl>> | null>(null)
   const [chatInput, setChatInput] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
-  const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; timestamp?: string }>>([
+  const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; timestamp?: string; mode?: string }>>([
     {
       role: 'assistant',
       content:
-        'Hi — I am QuantX. Ask me about P&L, positions, orders, risk limits, cycles, or how trading works. Example: "What\'s my P&L?" or "Why were trades rejected?"',
+        'QuantX LLM coach ready. Connect an API key (Groq / OpenAI / OpenRouter) in LLM settings, then ask why trades lost money or click Analyze losses for a full post-mortem.',
       timestamp: new Date().toISOString(),
+      mode: 'system',
     },
   ])
+  const [llmCfg, setLlmCfg] = useState<{
+    enabled: boolean
+    provider: string
+    model: string
+    has_api_key: boolean
+    mode: string
+    hint?: string
+    key_source?: string
+  } | null>(null)
+  const [llmKey, setLlmKey] = useState('')
+  const [llmProvider, setLlmProvider] = useState('groq')
+  const [llmModel, setLlmModel] = useState('')
+  const [showLlmSettings, setShowLlmSettings] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -143,6 +157,14 @@ export default function App() {
       setOrders(ords)
       setCycles(cyc)
       setPnlData(pnl)
+      try {
+        const cfg = await api.llmConfig()
+        setLlmCfg(cfg)
+        setLlmProvider(cfg.provider || 'groq')
+        setLlmModel(cfg.model || '')
+      } catch {
+        /* ignore */
+      }
     } catch (err) {
       setStatus(`Backend offline — start API on :8000 (${(err as Error).message})`)
     }
@@ -244,7 +266,7 @@ export default function App() {
     }
   }
 
-  const sendChat = async (preset?: string) => {
+  const sendChat = async (preset?: string, intent = 'chat') => {
     const text = (preset ?? chatInput).trim()
     if (!text || chatBusy) return
     setChatBusy(true)
@@ -253,16 +275,74 @@ export default function App() {
     setChatMessages((prev) => [...prev, userMsg])
     try {
       const history = [...chatMessages, userMsg].map((m) => ({ role: m.role, content: m.content }))
-      const res = await api.chat(text, history)
+      const res = await api.chat(text, history, intent)
       setChatMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: res.content, timestamp: res.timestamp },
+        {
+          role: 'assistant',
+          content: res.content,
+          timestamp: res.timestamp,
+          mode: res.mode,
+        },
       ])
+      if (res.mode === 'fallback_rules') {
+        setShowLlmSettings(true)
+      }
     } catch (err) {
       setChatMessages((prev) => [
         ...prev,
         { role: 'assistant', content: `Chat error: ${(err as Error).message}`, timestamp: new Date().toISOString() },
       ])
+    } finally {
+      setChatBusy(false)
+    }
+  }
+
+  const analyzeLosses = async () => {
+    setChatBusy(true)
+    const userMsg = {
+      role: 'user' as const,
+      content: 'Analyze my losses — what did strategy/logic miss?',
+      timestamp: new Date().toISOString(),
+    }
+    setChatMessages((prev) => [...prev, userMsg])
+    try {
+      const history = [...chatMessages, userMsg].map((m) => ({ role: m.role, content: m.content }))
+      const res = await api.reviewLosses(history)
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: res.content, timestamp: res.timestamp, mode: res.mode },
+      ])
+      if (res.mode === 'fallback_rules') setShowLlmSettings(true)
+    } catch (err) {
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: `Loss review error: ${(err as Error).message}`, timestamp: new Date().toISOString() },
+      ])
+    } finally {
+      setChatBusy(false)
+    }
+  }
+
+  const saveLlm = async () => {
+    setChatBusy(true)
+    try {
+      const cfg = await api.setLlmConfig(llmKey, llmProvider, llmModel)
+      setLlmCfg(cfg)
+      setLlmKey('')
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: cfg.has_api_key
+            ? `LLM enabled via ${cfg.provider} (${cfg.model}). Ask about losses or click Analyze losses.`
+            : 'API key cleared. Chat will use fallback until a key is set.',
+          timestamp: new Date().toISOString(),
+          mode: cfg.mode,
+        },
+      ])
+    } catch (err) {
+      setStatus(`LLM config failed: ${(err as Error).message}`)
     } finally {
       setChatBusy(false)
     }
@@ -465,18 +545,69 @@ export default function App() {
       {tab === 'chat' && (
         <section className="panel" style={{ marginBottom: '1rem' }}>
           <div className="panel-head">
-            <h2>Chat with QuantX</h2>
+            <h2>LLM Coach</h2>
+            <div className="actions">
+              <span className={`pill ${llmCfg?.has_api_key ? 'valid' : 'invalid'}`}>
+                {llmCfg?.has_api_key ? `LLM · ${llmCfg.provider}` : 'LLM OFF'}
+              </span>
+              <button className="btn" type="button" onClick={() => setShowLlmSettings((v) => !v)}>
+                LLM settings
+              </button>
+              <button className="btn warn" type="button" disabled={chatBusy} onClick={analyzeLosses}>
+                Analyze losses
+              </button>
+            </div>
           </div>
+
+          {showLlmSettings && (
+            <div className="rec-detail" style={{ marginBottom: '0.85rem' }}>
+              <p className="prose">
+                {llmCfg?.hint || 'Add a provider API key to enable LLM post-mortems on losses and strategy gaps.'}
+                {llmCfg?.has_api_key ? ` Key source: ${llmCfg.mode === 'llm' ? 'configured' : llmCfg.mode}.` : ''}
+              </p>
+              <div className="scan-row">
+                <select
+                  value={llmProvider}
+                  onChange={(e) => setLlmProvider(e.target.value)}
+                  style={{
+                    background: 'var(--bg-0)',
+                    color: 'var(--text)',
+                    border: '1px solid var(--line)',
+                    borderRadius: 8,
+                    padding: '0.55rem 0.75rem',
+                  }}
+                >
+                  <option value="groq">Groq (recommended)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="openrouter">OpenRouter</option>
+                </select>
+                <input
+                  type="password"
+                  value={llmKey}
+                  onChange={(e) => setLlmKey(e.target.value)}
+                  placeholder={llmCfg?.has_api_key ? '•••• key saved — paste to replace' : 'Paste API key'}
+                />
+                <input
+                  value={llmModel}
+                  onChange={(e) => setLlmModel(e.target.value)}
+                  placeholder="Model (optional)"
+                />
+                <button className="btn primary" type="button" disabled={chatBusy} onClick={saveLlm}>
+                  Save
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="chat-hints">
             {[
-              "What's my P&L?",
-              'Show open positions',
-              'Why were trades rejected?',
-              'What are risk limits?',
-              'Explain last cycle',
-              'How does QuantX trade?',
+              'Why did we lose money?',
+              'What did the strategy miss?',
+              'Which filters failed on losing trades?',
+              'How should we improve entry logic?',
+              'Was risk management followed?',
             ].map((q) => (
-              <button key={q} type="button" disabled={chatBusy} onClick={() => sendChat(q)}>
+              <button key={q} type="button" disabled={chatBusy} onClick={() => sendChat(q, 'loss_review')}>
                 {q}
               </button>
             ))}
@@ -485,7 +616,10 @@ export default function App() {
             <div className="chat-log">
               {chatMessages.map((m, i) => (
                 <div key={`${m.role}-${i}`} className={`chat-bubble ${m.role}`}>
-                  <span className="who">{m.role === 'user' ? 'You' : 'QuantX'}</span>
+                  <span className="who">
+                    {m.role === 'user' ? 'You' : 'QuantX LLM'}
+                    {m.mode ? ` · ${m.mode}` : ''}
+                  </span>
                   {m.content}
                 </div>
               ))}
@@ -494,7 +628,7 @@ export default function App() {
               <textarea
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Ask QuantX anything about your paper book, risk, orders, cycles…"
+                placeholder="Ask for loss reasons, missed signals, strategy gaps…"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()

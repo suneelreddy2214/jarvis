@@ -275,10 +275,57 @@ export const api = {
         exit_reason?: string | null
       }>
     }>('/api/pnl'),
-  chat: (message: string, history: Array<{ role: string; content: string }> = []) =>
-    req<{ role: string; content: string; timestamp: string; sources: string[] }>('/api/chat', {
+  chat: (message: string, history: Array<{ role: string; content: string }> = [], intent = 'chat') =>
+    req<{
+      role: string
+      content: string
+      timestamp: string
+      sources: string[]
+      mode?: string
+      provider?: string
+      model?: string | null
+      error?: string | null
+      analysis_stats?: Record<string, number> | null
+    }>('/api/chat', {
       method: 'POST',
-      body: JSON.stringify({ message, history }),
+      body: JSON.stringify({ message, history, intent }),
+    }),
+  reviewLosses: (history: Array<{ role: string; content: string }> = []) =>
+    req<{
+      role: string
+      content: string
+      timestamp: string
+      mode?: string
+      provider?: string
+      model?: string | null
+      analysis_stats?: Record<string, number> | null
+    }>('/api/chat/review-losses', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'review losses', history, intent: 'loss_review' }),
+    }),
+  llmConfig: () =>
+    req<{
+      enabled: boolean
+      provider: string
+      model: string
+      has_api_key: boolean
+      key_source: string
+      mode: string
+      supported_providers: string[]
+      hint: string
+    }>('/api/chat/llm-config'),
+  setLlmConfig: (api_key: string, provider: string, model = '') =>
+    req<{
+      enabled: boolean
+      provider: string
+      model: string
+      has_api_key: boolean
+      mode: string
+      hint?: string
+      key_source?: string
+    }>('/api/chat/llm-config', {
+      method: 'POST',
+      body: JSON.stringify({ api_key, provider, model }),
     }),
   cycles: () =>
     req<

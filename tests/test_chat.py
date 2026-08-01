@@ -1,4 +1,4 @@
-"""Chat assistant tests."""
+"""LLM chat / loss-review tests (no external network required)."""
 
 from __future__ import annotations
 
@@ -8,100 +8,100 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from quantx.core.chat import QuantXChat
+from quantx.core.chat import QuantXLLMChat
+
+
+_STORE: dict = {}
+
+
+def _store(op, key, value=None):
+    if op == "get":
+        return _STORE.get(key, value)
+    if op == "set":
+        _STORE[key] = value
+        return True
+    return None
 
 
 def _ctx():
     return {
-        "portfolio": {
-            "capital": 1_000_000,
-            "total_pnl": -1200,
-            "unrealized_pnl": -500,
-            "open_positions": 2,
-            "trading_halted": False,
-            "halt_reason": None,
-            "mode": "paper",
-            "available_margin": 900000,
-            "used_margin": 100000,
-            "drawdown_pct": 1.2,
-        },
-        "risk": {
-            "can_trade": True,
-            "reasons": [],
-            "drawdown_pct": 1.2,
-            "daily_loss_used_pct": 0.1,
-            "consecutive_losses": 0,
-            "open_positions": 2,
-            "risk_budget_remaining": 10000,
-        },
+        "portfolio": {"capital": 950000, "total_pnl": -50000, "unrealized_pnl": 0, "open_positions": 0, "trading_halted": False, "mode": "paper", "drawdown_pct": 5},
+        "risk": {"can_trade": True, "reasons": [], "drawdown_pct": 5, "daily_loss_used_pct": 1, "consecutive_losses": 2, "open_positions": 0, "risk_budget_remaining": 9500},
         "positions": [
             {
-                "symbol": "RELIANCE",
-                "side": "BUY",
-                "quantity": 10,
-                "entry_price": 2800,
-                "current_price": 2790,
-                "pnl": -100,
-                "pnl_pct": -0.35,
-                "status": "OPEN",
-                "stop_loss": 2740,
-                "target_1": 2920,
-            }
-        ],
-        "orders": [
+                "symbol": "TCS",
+                "side": "SELL",
+                "quantity": 20,
+                "entry_price": 3600,
+                "exit_price": 3700,
+                "current_price": 3700,
+                "pnl": -2000,
+                "pnl_pct": -2.7,
+                "status": "CLOSED",
+                "stop_loss": 3680,
+                "target_1": 3400,
+                "exit_reason": "Stop loss / trailing stop hit",
+                "reason": "SHORT setup weak ADX",
+            },
             {
-                "symbol": "RELIANCE",
+                "symbol": "INFY",
                 "side": "BUY",
-                "quantity": 10,
-                "price": 2800,
-                "status": "FILLED",
-                "message": "paper fill",
-                "created_at": "2026-08-01T10:00:00",
-            }
+                "quantity": 30,
+                "entry_price": 1500,
+                "exit_price": 1540,
+                "pnl": 1200,
+                "pnl_pct": 2.6,
+                "status": "CLOSED",
+                "exit_reason": "Target 1 hit",
+            },
         ],
+        "orders": [],
         "cycles": [
             {
-                "cycle_no": 3,
-                "message": "Cycle #3: valid 1/10, executed 0, rejected 1",
+                "cycle_no": 4,
+                "message": "rejected 1",
                 "valid_count": 1,
-                "scanned": 10,
+                "scanned": 8,
                 "executed_count": 0,
                 "rejected_count": 1,
                 "executed": [],
-                "rejected": [{"symbol": "TCS", "reason": "Already in position — no averaging"}],
+                "rejected": [{"symbol": "RELIANCE", "reason": "Already in position — no averaging"}],
+                "created_at": "2026-08-01T10:00:00Z",
             }
         ],
-        "journal": [],
-        "performance": {"total_fees": 200, "win_rate": 0, "wins": 0, "losses": 0},
-        "pnl": {"summary": {"capital": 1000000, "total_pnl": -1200, "unrealized_pnl": -500, "closed_realized_pnl": -700, "total_fees": 200, "win_rate": 0, "wins": 0, "losses": 1, "open_positions": 2, "closed_trades": 1}},
-        "paper": {"running": True, "cycles": 3, "executed": 1, "rejected": 2, "last_message": "Cycle #3"},
-        "emergency": {"kill_switch": False, "max_drawdown_lock": False, "manual_override": False, "messages": []},
-        "macro": {"nifty_change_pct": 0.4, "india_vix": 14.2},
-        "config": {"risk": {"max_risk_per_trade_pct": 1, "max_daily_loss_pct": 2, "max_drawdown_pct": 10, "max_consecutive_losses": 3, "max_open_positions": 5}},
-        "watchlist_symbols": ["RELIANCE", "TCS"],
+        "journal": [
+            {"symbol": "TCS", "pnl": -2000, "mistakes": "Stop too tight", "lessons": "Use ATR stop", "market_condition": "Stop loss"}
+        ],
+        "performance": {"total_fees": 300, "win_rate": 50, "wins": 1, "losses": 1},
+        "pnl": {"summary": {"capital": 950000, "total_pnl": -50000}},
+        "paper": {"running": True, "cycles": 4, "executed": 2, "rejected": 3, "last_message": "ok"},
+        "emergency": {"kill_switch": False, "messages": []},
+        "macro": {"india_vix": 18.5},
+        "config": {"risk": {"max_risk_per_trade_pct": 1}},
     }
 
 
-def test_chat_pnl():
-    bot = QuantXChat(_ctx)
-    res = bot.ask("What's my P&L?")
-    assert res["role"] == "assistant"
-    assert "P&L" in res["content"] or "Capital" in res["content"]
+def test_llm_config_without_key():
+    _STORE.clear()
+    bot = QuantXLLMChat(_ctx, settings_store=_store)
+    cfg = bot.get_llm_config()
+    assert cfg["has_api_key"] is False
+    assert cfg["mode"] == "fallback_rules"
 
 
-def test_chat_positions():
-    bot = QuantXChat(_ctx)
-    res = bot.ask("Show open positions")
-    assert "RELIANCE" in res["content"]
+def test_set_api_key_enables_llm_flag():
+    _STORE.clear()
+    bot = QuantXLLMChat(_ctx, settings_store=_store)
+    cfg = bot.set_api_key("test-key", provider="groq", model="llama-3.3-70b-versatile")
+    assert cfg["has_api_key"] is True
+    assert cfg["provider"] == "groq"
+    assert cfg["enabled"] is True
 
 
-def test_chat_rejections():
-    bot = QuantXChat(_ctx)
-    res = bot.ask("Why were trades rejected?")
-    assert "TCS" in res["content"] or "reject" in res["content"].lower()
-
-
-def test_chat_symbol():
-    bot = QuantXChat(_ctx)
-    res = bot.ask("Status of RELIANCE")
-    assert "RELIANCE" in res["content"]
+def test_fallback_loss_review_without_network():
+    _STORE.clear()
+    bot = QuantXLLMChat(_ctx, settings_store=_store)
+    res = bot.review_losses()
+    assert res["mode"] == "fallback_rules"
+    assert "TCS" in res["content"]
+    assert res["analysis_stats"]["losses"] == 1

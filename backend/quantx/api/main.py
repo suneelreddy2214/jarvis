@@ -50,6 +50,7 @@ def _chat_context() -> dict:
     opens = [p.model_dump(mode="json") for p in db.list_positions("OPEN")]
     closed = [p.model_dump(mode="json") for p in db.list_positions("CLOSED")]
     paper = paper_agent.status().get("session", {})
+    perf = portfolio.performance()
     return {
         "portfolio": snap.model_dump(),
         "risk": risk.model_dump(),
@@ -58,17 +59,17 @@ def _chat_context() -> dict:
         "orders": db.list_orders(100),
         "cycles": paper_agent.list_cycles(20),
         "journal": [j.model_dump(mode="json") for j in db.list_journal(50)],
-        "performance": portfolio.performance(),
+        "performance": perf,
         "pnl": {
             "summary": {
                 "capital": snap.capital,
                 "total_pnl": snap.total_pnl,
                 "unrealized_pnl": snap.unrealized_pnl,
-                "closed_realized_pnl": snap.realized_pnl_today,
-                "total_fees": portfolio.performance().get("total_fees", 0),
-                "win_rate": portfolio.performance().get("win_rate", 0),
-                "wins": portfolio.performance().get("wins", 0),
-                "losses": portfolio.performance().get("losses", 0),
+                "closed_realized_pnl": sum(float(p.get("pnl") or 0) for p in closed),
+                "total_fees": perf.get("total_fees", 0),
+                "win_rate": perf.get("win_rate", 0),
+                "wins": perf.get("wins", 0),
+                "losses": perf.get("losses", 0),
                 "open_positions": snap.open_positions,
                 "closed_trades": len(closed),
             }
@@ -81,7 +82,26 @@ def _chat_context() -> dict:
     }
 
 
-chat_assistant = QuantXChat(_chat_context)
+def _llm_settings_store(op: str, key: str, default=None):
+    if op == "get":
+        return db.get_state(key, default)
+    if op == "set":
+        db.set_state(key, default if key == "value_placeholder" else default)
+        # signature: store("set", key, value) — fix below
+        return None
+    return default
+
+
+def _llm_store(op: str, key: str, value=None):
+    if op == "get":
+        return db.get_state(key, value)
+    if op == "set":
+        db.set_state(key, value)
+        return True
+    return None
+
+
+chat_assistant = QuantXChat(_chat_context, settings_store=_llm_store)
 
 
 @asynccontextmanager
@@ -167,6 +187,13 @@ class BacktestRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[dict] = Field(default_factory=list)
+    intent: str = "chat"  # chat | loss_review
+
+
+class LLMConfigRequest(BaseModel):
+    api_key: str = ""
+    provider: str = "groq"  # openai | groq | openrouter
+    model: str = ""
 
 
 @app.get("/api/health")
@@ -388,10 +415,32 @@ def chat(req: ChatRequest):
     if not req.message or not req.message.strip():
         raise HTTPException(400, "message is required")
     try:
-        return chat_assistant.ask(req.message.strip(), history=req.history)
+        return chat_assistant.ask(req.message.strip(), history=req.history, intent=req.intent or "chat")
     except Exception as e:
         logger.exception("Chat failed")
         raise HTTPException(500, str(e))
+
+
+@app.post("/api/chat/review-losses")
+def chat_review_losses(req: ChatRequest = ChatRequest(message="review losses", intent="loss_review")):
+    try:
+        return chat_assistant.review_losses(history=req.history)
+    except Exception as e:
+        logger.exception("Loss review failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/chat/llm-config")
+def get_llm_config():
+    return chat_assistant.get_llm_config()
+
+
+@app.post("/api/chat/llm-config")
+def set_llm_config(req: LLMConfigRequest):
+    try:
+        return chat_assistant.set_api_key(req.api_key, provider=req.provider, model=req.model)
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 
 # —— Paper trading session ——

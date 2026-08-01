@@ -1,399 +1,460 @@
 """
-QuantX Chat Assistant — answers operator questions using live agent context.
+QuantX LLM Chat — strategy/loss post-mortem reasoning.
 
-No external LLM required. Optional OpenAI enhancement if QUANTX_OPENAI_API_KEY is set.
+LLM-first. Rule-based answers are only a fallback when no provider key is configured.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
-import re
-from datetime import datetime
-from typing import Any, Optional
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are QuantX, an institutional-grade trading coach embedded in a paper-trading system for NSE/BSE.
+
+Primary mission: capital preservation first, then risk-adjusted returns.
+
+Your job in chat is NOT to place orders. Your job is to:
+1. Explain WHY trades made or lost money using the live context JSON.
+2. Identify what the strategy/logic missed (entries, exits, filters, sizing, regime).
+3. Point out process mistakes (averaging, ignoring volume, weak ADX, VIX spikes, etc.).
+4. Suggest concrete rule improvements — never revenge trades or removing stops.
+5. Be specific: cite symbols, prices, PnL, indicators, rejection reasons from context.
+6. If context is missing data, say what is missing instead of inventing fills.
+
+Hard rules you must respect and reinforce:
+- Max 1% capital risk per trade
+- Max 2% daily / 5% weekly loss
+- Min RR 1:2
+- Stop after 3 consecutive losses
+- Never average losers / never remove stops
+
+Answer in clear markdown. Prefer short sections:
+- Verdict
+- What happened
+- What we missed
+- Strategy/logic gaps
+- Actionable fixes
+"""
 
 
-class QuantXChat:
-    """Context-aware Q&A over paper trading state."""
+class LLMProviderError(RuntimeError):
+    pass
 
-    def __init__(self, context_provider):
-        """
-        context_provider: callable returning a dict with keys:
-          portfolio, risk, positions, orders, cycles, performance, pnl, session, config, emergency
-        """
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class QuantXLLMChat:
+    """LLM-based QuantX assistant with rich loss/strategy context."""
+
+    def __init__(self, context_provider: Callable[[], dict], settings_store: Optional[Callable] = None):
         self._get_context = context_provider
+        # settings_store(get|set) for persisted API key in SQLite
+        self._store = settings_store
 
-    def ask(self, message: str, history: Optional[list[dict]] = None) -> dict:
-        text = (message or "").strip()
-        if not text:
-            return self._reply("Ask me about P&L, positions, orders, risk, cycles, or how QuantX trades.")
-
-        ctx = self._get_context()
-        lower = text.lower()
-
-        # Optional LLM path
-        if os.getenv("QUANTX_OPENAI_API_KEY"):
-            try:
-                return self._ask_openai(text, ctx, history or [])
-            except Exception as e:
-                # Fall back to rule-based
-                llm_note = f"(LLM unavailable: {e}) "
-
-        else:
-            llm_note = ""
-
-        answer = self._route(lower, text, ctx)
-        return self._reply(llm_note + answer, ctx)
-
-    def _reply(self, content: str, ctx: Optional[dict] = None) -> dict:
+    # —— config ——
+    def get_llm_config(self) -> dict:
+        key = self._resolve_api_key()
+        provider = self._resolve_provider()
         return {
-            "role": "assistant",
-            "content": content,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "sources": self._sources(ctx) if ctx else [],
+            "enabled": bool(key),
+            "provider": provider,
+            "model": self._resolve_model(provider),
+            "has_api_key": bool(key),
+            "key_source": self._key_source(),
+            "mode": "llm" if key else "fallback_rules",
+            "supported_providers": ["openai", "groq", "openrouter"],
+            "env_vars": [
+                "QUANTX_LLM_PROVIDER",
+                "QUANTX_OPENAI_API_KEY or OPENAI_API_KEY",
+                "QUANTX_GROQ_API_KEY or GROQ_API_KEY",
+                "QUANTX_OPENROUTER_API_KEY",
+                "QUANTX_LLM_MODEL",
+            ],
+            "hint": (
+                "Paste an API key in Chat settings (or set env). "
+                "Groq free tier works well for loss post-mortems."
+            ),
         }
 
-    def _sources(self, ctx: dict) -> list[str]:
-        return [
-            "portfolio",
-            "risk",
-            "positions",
-            "orders",
-            "cycles",
-            "paper_session",
-        ]
+    def set_api_key(self, api_key: str, provider: str = "groq", model: str = "") -> dict:
+        api_key = (api_key or "").strip()
+        provider = (provider or "groq").strip().lower()
+        if provider not in ("openai", "groq", "openrouter"):
+            raise ValueError("provider must be openai|groq|openrouter")
+        if not self._store:
+            raise RuntimeError("No settings store configured")
+        if api_key:
+            self._store("set", "llm_api_key", api_key)
+            self._store("set", "llm_provider", provider)
+            if model:
+                self._store("set", "llm_model", model)
+        else:
+            self._store("set", "llm_api_key", "")
+        return self.get_llm_config()
 
-    def _route(self, lower: str, original: str, ctx: dict) -> str:
-        if self._match(lower, ["help", "what can you", "commands", "how to ask"]):
-            return self._help()
+    def _store_get(self, key: str, default=None):
+        if not self._store:
+            return default
+        return self._store("get", key, default)
 
-        if self._match(lower, ["how do you trade", "how does quantx", "how trading works", "explain agent", "how you work"]):
-            return self._how_trading_works()
-
-        if self._match(lower, ["risk", "limits", "drawdown", "kill switch", "can i trade", "can trade", "halt"]):
-            return self._risk(ctx)
-
-        if self._match(lower, ["pnl", "p&l", "profit", "loss", "performance", "returns", "fees"]):
-            return self._pnl(ctx)
-
-        if self._match(lower, ["position", "open trade", "holdings", "what am i holding"]):
-            return self._positions(ctx)
-
-        if self._match(lower, ["order", "fill", "filled", "execution"]):
-            sym = self._extract_symbol(original, ctx)
-            return self._orders(ctx, sym)
-
-        if self._match(lower, ["cycle", "scan", "last cycle", "session", "running"]):
-            return self._cycles(ctx)
-
-        if self._match(lower, ["journal", "closed", "past trade", "history"]):
-            return self._journal(ctx)
-
-        if self._match(lower, ["capital", "margin", "balance", "cash"]):
-            return self._capital(ctx)
-
-        if self._match(lower, ["strategy", "strategies", "swing", "breakout"]):
-            return self._strategies()
-
-        if self._match(lower, ["why reject", "rejected", "why no trade", "why not"]):
-            return self._rejections(ctx)
-
-        if self._match(lower, ["emergency", "panic", "kill"]):
-            return self._emergency(ctx)
-
-        if self._match(lower, ["macro", "vix", "nifty", "market"]):
-            return self._macro(ctx)
-
-        # Symbol-specific
-        sym = self._extract_symbol(original, ctx)
-        if sym:
-            return self._symbol_brief(sym, ctx)
-
+    def _resolve_api_key(self) -> str:
+        stored = self._store_get("llm_api_key") or ""
+        if stored:
+            return stored
+        provider = self._resolve_provider()
+        if provider == "groq":
+            return os.getenv("QUANTX_GROQ_API_KEY") or os.getenv("GROQ_API_KEY") or ""
+        if provider == "openrouter":
+            return os.getenv("QUANTX_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY") or ""
         return (
-            "I can clarify QuantX live state. Try asking:\n"
-            "• What's my P&L?\n"
-            "• Show open positions\n"
-            "• Show orders / cycles\n"
-            "• What are risk limits?\n"
-            "• Why were trades rejected?\n"
-            "• How does QuantX trade?\n"
-            "• Status of RELIANCE\n"
-            f"\nRight now: session={'RUNNING' if ctx.get('paper', {}).get('running') else 'IDLE'}, "
-            f"open positions={ctx.get('portfolio', {}).get('open_positions', 0)}, "
-            f"can_trade={ctx.get('risk', {}).get('can_trade')}."
+            os.getenv("QUANTX_OPENAI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("QUANTX_GROQ_API_KEY")
+            or os.getenv("GROQ_API_KEY")
+            or ""
         )
 
-    def _match(self, lower: str, keys: list[str]) -> bool:
-        return any(k in lower for k in keys)
+    def _key_source(self) -> str:
+        if self._store_get("llm_api_key"):
+            return "dashboard"
+        if os.getenv("QUANTX_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY"):
+            return "env_openai"
+        if os.getenv("QUANTX_GROQ_API_KEY") or os.getenv("GROQ_API_KEY"):
+            return "env_groq"
+        if os.getenv("QUANTX_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+            return "env_openrouter"
+        return "none"
 
-    def _extract_symbol(self, text: str, ctx: dict) -> Optional[str]:
-        known = set()
-        for p in ctx.get("positions") or []:
-            known.add(str(p.get("symbol", "")).upper())
-        for o in ctx.get("orders") or []:
-            known.add(str(o.get("symbol", "")).upper())
-        for s in (ctx.get("watchlist_symbols") or []):
-            known.add(str(s).upper())
-        # Also common NSE names
-        known.update(
-            {
-                "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
-                "ITC", "LT", "AXISBANK", "BHARTIARTL",
-            }
-        )
-        tokens = re.findall(r"[A-Za-z]{2,15}", text.upper())
-        for t in tokens:
-            if t in known:
-                return t
-        return None
+    def _resolve_provider(self) -> str:
+        stored = (self._store_get("llm_provider") or "").lower()
+        if stored in ("openai", "groq", "openrouter"):
+            return stored
+        env = (os.getenv("QUANTX_LLM_PROVIDER") or "").lower()
+        if env in ("openai", "groq", "openrouter"):
+            return env
+        if os.getenv("QUANTX_GROQ_API_KEY") or os.getenv("GROQ_API_KEY"):
+            return "groq"
+        if os.getenv("QUANTX_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+            return "openrouter"
+        return "openai"
 
-    def _help(self) -> str:
-        return (
-            "**QuantX Chat** — ask for clarification on live paper trading.\n\n"
-            "Examples:\n"
-            "• What's my P&L today?\n"
-            "• Show open positions and unrealized loss\n"
-            "• List recent orders\n"
-            "• Explain the last cycle\n"
-            "• Why were trades rejected?\n"
-            "• What are my risk limits?\n"
-            "• How does QuantX decide entries?\n"
-            "• Status of INFY\n"
-        )
+    def _resolve_model(self, provider: str) -> str:
+        stored = self._store_get("llm_model") or ""
+        if stored:
+            return stored
+        env = os.getenv("QUANTX_LLM_MODEL")
+        if env:
+            return env
+        if provider == "groq":
+            return "llama-3.3-70b-versatile"
+        if provider == "openrouter":
+            return "openai/gpt-4o-mini"
+        return "gpt-4o-mini"
 
-    def _how_trading_works(self) -> str:
-        return (
-            "QuantX paper trading loop:\n"
-            "1. Every cycle — mark positions to market; exit on SL / trail / T1 / T2\n"
-            "2. Check risk gates (1% per trade, 2% daily, 5% weekly, max DD, 3-loss stop)\n"
-            "3. Pull NSE data via yfinance; run TA + strategy filters\n"
-            "4. Size so stop risk ≤ 1% capital; require RR ≥ 1:2\n"
-            "5. PaperBroker fills with slippage + fees (not live Zerodha unless configured)\n"
-            "6. Never average into an existing symbol; never remove stops\n\n"
-            "Capital preservation always comes first."
-        )
+    def _endpoint(self, provider: str) -> str:
+        if provider == "groq":
+            return "https://api.groq.com/openai/v1/chat/completions"
+        if provider == "openrouter":
+            return "https://openrouter.ai/api/v1/chat/completions"
+        return "https://api.openai.com/v1/chat/completions"
 
-    def _risk(self, ctx: dict) -> str:
-        r = ctx.get("risk") or {}
-        p = ctx.get("portfolio") or {}
-        cfg = (ctx.get("config") or {}).get("risk") or {}
-        reasons = r.get("reasons") or []
-        return (
-            f"**Risk status**\n"
-            f"• Can trade: {'YES' if r.get('can_trade') else 'NO'}\n"
-            f"• Drawdown: {r.get('drawdown_pct', p.get('drawdown_pct', 0)):.2f}% "
-            f"(limit {cfg.get('max_drawdown_pct', 10)}%)\n"
-            f"• Daily loss used: {r.get('daily_loss_used_pct', 0):.2f}% "
-            f"(limit {cfg.get('max_daily_loss_pct', 2)}%)\n"
-            f"• Consecutive losses: {r.get('consecutive_losses', 0)} "
-            f"(halt at {cfg.get('max_consecutive_losses', 3)})\n"
-            f"• Open positions: {r.get('open_positions', 0)} / {cfg.get('max_open_positions', 5)}\n"
-            f"• Per-trade risk budget: ₹{r.get('risk_budget_remaining', 0):,.0f} "
-            f"({cfg.get('max_risk_per_trade_pct', 1)}%)\n"
-            f"• Halted: {p.get('trading_halted')} — {p.get('halt_reason') or 'none'}\n"
-            + (f"• Blockers: {'; '.join(reasons)}\n" if reasons else "")
-        )
-
-    def _pnl(self, ctx: dict) -> str:
-        s = (ctx.get("pnl") or {}).get("summary") or ctx.get("performance") or {}
-        p = ctx.get("portfolio") or {}
-        return (
-            f"**P&L snapshot**\n"
-            f"• Capital: ₹{s.get('capital', p.get('capital', 0)):,.2f}\n"
-            f"• Total P&L: ₹{s.get('total_pnl', p.get('total_pnl', 0)):,.2f}\n"
-            f"• Unrealized: ₹{s.get('unrealized_pnl', p.get('unrealized_pnl', 0)):,.2f}\n"
-            f"• Realized (closed): ₹{s.get('closed_realized_pnl', p.get('realized_pnl_today', 0)):,.2f}\n"
-            f"• Fees: ₹{s.get('total_fees', 0):,.2f}\n"
-            f"• Win rate: {s.get('win_rate', 0):.1f}% "
-            f"({s.get('wins', 0)}W / {s.get('losses', 0)}L)\n"
-            f"• Open / Closed: {s.get('open_positions', p.get('open_positions', 0))} / "
-            f"{s.get('closed_trades', 0)}\n"
-            f"Open the **P&L** tab for order-level detail."
-        )
-
-    def _positions(self, ctx: dict) -> str:
-        opens = [p for p in (ctx.get("positions") or []) if p.get("status") == "OPEN"]
-        if not opens:
-            opens = ctx.get("open_positions") or []
-        if not opens:
-            return "No open positions right now."
-        lines = ["**Open positions**"]
-        for p in opens:
-            lines.append(
-                f"• {p.get('symbol')} {p.get('side')} x{p.get('quantity')} "
-                f"entry {p.get('entry_price')} LTP {p.get('current_price')} "
-                f"PnL ₹{float(p.get('pnl') or 0):,.2f} ({float(p.get('pnl_pct') or 0):+.2f}%) "
-                f"SL {p.get('stop_loss')} T1 {p.get('target_1')}"
+    # —— public ask ——
+    def ask(self, message: str, history: Optional[list[dict]] = None, intent: str = "chat") -> dict:
+        text = (message or "").strip()
+        if not text:
+            return self._pack(
+                "Ask me to review losses, missed strategy signals, or improve logic. "
+                "Example: “Why did we lose on TCS?” or “What did the strategy miss today?”"
             )
-        return "\n".join(lines)
 
-    def _orders(self, ctx: dict, symbol: Optional[str] = None) -> str:
-        orders = ctx.get("orders") or []
-        if symbol:
-            orders = [o for o in orders if str(o.get("symbol", "")).upper() == symbol]
-        if not orders:
-            return f"No orders found{f' for {symbol}' if symbol else ''}."
-        lines = [f"**Recent orders{f' — {symbol}' if symbol else ''}** (latest first)"]
-        for o in orders[:15]:
-            lines.append(
-                f"• {o.get('created_at', '')[:19]} {o.get('symbol')} {o.get('side')} "
-                f"x{o.get('quantity')} @ {o.get('price')} [{o.get('status')}] "
-                f"{o.get('message', '')[:80]}"
+        ctx = self._get_context()
+        analysis_ctx = self._build_analysis_context(ctx, intent=intent, question=text)
+
+        api_key = self._resolve_api_key()
+        if not api_key:
+            return self._pack(
+                self._no_key_message() + "\n\n---\n" + self._fallback_loss_brief(analysis_ctx),
+                mode="fallback_rules",
+                analysis=analysis_ctx.get("loss_review"),
             )
-        return "\n".join(lines)
 
-    def _cycles(self, ctx: dict) -> str:
-        paper = ctx.get("paper") or {}
-        cycles = ctx.get("cycles") or []
-        lines = [
-            f"**Paper session**: {'RUNNING' if paper.get('running') else 'IDLE'}",
-            f"• Cycles: {paper.get('cycles', 0)} | Executed: {paper.get('executed', 0)} | "
-            f"Rejected: {paper.get('rejected', 0)}",
-            f"• Last: {paper.get('last_message', '—')}",
-            "",
-            "**Recent cycles**",
-        ]
-        if not cycles:
-            lines.append("No cycle history yet. Click Start Auto or Run Cycle.")
-        for c in cycles[:8]:
-            lines.append(
-                f"• #{c.get('cycle_no')} valid {c.get('valid_count')}/{c.get('scanned')} "
-                f"filled {c.get('executed_count')} rej {c.get('rejected_count')} — {c.get('message')}"
+        try:
+            content = self._call_llm(text, analysis_ctx, history or [], intent=intent)
+            return self._pack(content, mode="llm", analysis=analysis_ctx.get("loss_review"))
+        except Exception as e:
+            logger.exception("LLM chat failed")
+            return self._pack(
+                f"LLM call failed: {e}\n\nFalling back to structured loss brief:\n\n"
+                + self._fallback_loss_brief(analysis_ctx),
+                mode="fallback_rules",
+                error=str(e),
+                analysis=analysis_ctx.get("loss_review"),
             )
-            for e in (c.get("executed") or [])[:5]:
-                lines.append(
-                    f"    FILL {e.get('symbol')} {e.get('side')} "
-                    f"{e.get('quantity')}@{e.get('fill_price')}"
-                )
-            for r in (c.get("rejected") or [])[:5]:
-                lines.append(f"    REJ {r.get('symbol')}: {r.get('reason')}")
-        return "\n".join(lines)
 
-    def _journal(self, ctx: dict) -> str:
+    def review_losses(self, history: Optional[list[dict]] = None) -> dict:
+        prompt = (
+            "Perform a full post-mortem on all losing trades and recent rejected signals. "
+            "Explain root causes, what strategy/logic missed, and prioritized fixes. "
+            "Be blunt and specific using the context."
+        )
+        return self.ask(prompt, history=history, intent="loss_review")
+
+    # —— context assembly ——
+    def _build_analysis_context(self, ctx: dict, intent: str, question: str) -> dict:
+        positions = ctx.get("positions") or []
+        closed = [p for p in positions if p.get("status") == "CLOSED"]
+        opens = [p for p in positions if p.get("status") == "OPEN"]
+        losses = [p for p in closed if float(p.get("pnl") or 0) <= 0]
+        wins = [p for p in closed if float(p.get("pnl") or 0) > 0]
         journal = ctx.get("journal") or []
-        if not journal:
-            return "Trade journal is empty — no closed trades logged yet."
-        lines = ["**Closed trades (journal)**"]
-        for j in journal[:12]:
-            lines.append(
-                f"• {j.get('symbol')} {j.get('side')} {j.get('quantity')} "
-                f"{j.get('entry')} → {j.get('exit')} PnL ₹{float(j.get('pnl') or 0):,.2f} "
-                f"| {j.get('market_condition') or j.get('lessons') or ''}"
-            )
-        return "\n".join(lines)
-
-    def _capital(self, ctx: dict) -> str:
-        p = ctx.get("portfolio") or {}
-        return (
-            f"**Capital**\n"
-            f"• Capital: ₹{float(p.get('capital') or 0):,.2f}\n"
-            f"• Available margin: ₹{float(p.get('available_margin') or 0):,.2f}\n"
-            f"• Used margin: ₹{float(p.get('used_margin') or 0):,.2f}\n"
-            f"• Mode: {p.get('mode', 'paper')}"
-        )
-
-    def _strategies(self) -> str:
-        return (
-            "**Strategies**\n"
-            "• `swing_trend` — EMA stack + SuperTrend + ADX continuation\n"
-            "• `breakout` — 20-day high/low break with volume expansion\n"
-            "• `intraday_mean_reversion` — RSI/BB fades when ADX is weak\n\n"
-            "All still require risk gates: ≤1% risk, RR ≥ 1:2, volume confirmation."
-        )
-
-    def _rejections(self, ctx: dict) -> str:
         cycles = ctx.get("cycles") or []
         rejected = []
-        for c in cycles[:10]:
+        for c in cycles[:15]:
             for r in c.get("rejected") or []:
-                rejected.append(f"Cycle #{c.get('cycle_no')}: {r.get('symbol')} — {r.get('reason')}")
-        if not rejected:
-            return (
-                "No recent rejections logged. Common reject reasons:\n"
-                "• Already in position (no averaging)\n"
-                "• Max open positions / no free slot\n"
-                "• Risk halt (drawdown / consecutive losses)\n"
-                "• Duplicate order same day\n"
-                "• Setup failed confidence / RR / volume gates"
-            )
-        return "**Recent rejections**\n" + "\n".join(f"• {x}" for x in rejected[:20])
-
-    def _emergency(self, ctx: dict) -> str:
-        e = ctx.get("emergency") or {}
-        return (
-            f"**Emergency controls**\n"
-            f"• Kill switch: {e.get('kill_switch')}\n"
-            f"• Max DD lock: {e.get('max_drawdown_lock')}\n"
-            f"• Manual override: {e.get('manual_override')}\n"
-            f"• Messages: {'; '.join(e.get('messages') or []) or 'none'}"
-        )
-
-    def _macro(self, ctx: dict) -> str:
-        m = ctx.get("macro") or {}
-        if not m:
-            return "Macro snapshot unavailable right now."
-        parts = [f"• {k}: {v}" for k, v in m.items()]
-        return "**Macro**\n" + "\n".join(parts)
-
-    def _symbol_brief(self, symbol: str, ctx: dict) -> str:
-        lines = [f"**{symbol}**"]
-        pos = [p for p in (ctx.get("positions") or []) if str(p.get("symbol", "")).upper() == symbol]
-        ords = [o for o in (ctx.get("orders") or []) if str(o.get("symbol", "")).upper() == symbol]
-        if pos:
-            for p in pos:
-                lines.append(
-                    f"• Position {p.get('status')}: {p.get('side')} x{p.get('quantity')} "
-                    f"entry {p.get('entry_price')} PnL ₹{float(p.get('pnl') or 0):,.2f}"
+                rejected.append(
+                    {
+                        "cycle": c.get("cycle_no"),
+                        "symbol": r.get("symbol"),
+                        "reason": r.get("reason"),
+                        "when": c.get("created_at"),
+                    }
                 )
-        else:
-            lines.append("• No open/closed position row matched in current book.")
-        if ords:
-            lines.append("• Recent orders:")
-            for o in ords[:5]:
-                lines.append(
-                    f"  - {o.get('created_at', '')[:19]} {o.get('side')} "
-                    f"x{o.get('quantity')} @ {o.get('price')} [{o.get('status')}]"
-                )
-        else:
-            lines.append("• No orders for this symbol yet.")
-        return "\n".join(lines)
 
-    def _ask_openai(self, message: str, ctx: dict, history: list[dict]) -> dict:
-        import json
-        import urllib.request
+        loss_review = {
+            "losing_trades": [
+                {
+                    "symbol": p.get("symbol"),
+                    "side": p.get("side"),
+                    "qty": p.get("quantity"),
+                    "entry": p.get("entry_price"),
+                    "exit": p.get("exit_price"),
+                    "pnl": p.get("pnl"),
+                    "pnl_pct": p.get("pnl_pct"),
+                    "stop_loss": p.get("stop_loss"),
+                    "target_1": p.get("target_1"),
+                    "exit_reason": p.get("exit_reason"),
+                    "reason_entry": (p.get("reason") or "")[:400],
+                    "opened_at": p.get("opened_at"),
+                    "closed_at": p.get("closed_at"),
+                }
+                for p in losses[:20]
+            ],
+            "winning_trades_sample": [
+                {
+                    "symbol": p.get("symbol"),
+                    "side": p.get("side"),
+                    "pnl": p.get("pnl"),
+                    "exit_reason": p.get("exit_reason"),
+                }
+                for p in wins[:10]
+            ],
+            "open_positions": [
+                {
+                    "symbol": p.get("symbol"),
+                    "side": p.get("side"),
+                    "entry": p.get("entry_price"),
+                    "ltp": p.get("current_price"),
+                    "pnl": p.get("pnl"),
+                    "stop_loss": p.get("stop_loss"),
+                    "target_1": p.get("target_1"),
+                }
+                for p in opens[:10]
+            ],
+            "recent_rejections": rejected[:25],
+            "journal_lessons": [
+                {
+                    "symbol": j.get("symbol"),
+                    "pnl": j.get("pnl"),
+                    "mistakes": j.get("mistakes"),
+                    "lessons": j.get("lessons"),
+                    "market_condition": j.get("market_condition"),
+                }
+                for j in journal[:15]
+                if float(j.get("pnl") or 0) <= 0 or j.get("mistakes")
+            ],
+            "stats": {
+                "closed": len(closed),
+                "losses": len(losses),
+                "wins": len(wins),
+                "total_loss_pnl": round(sum(float(p.get("pnl") or 0) for p in losses), 2),
+                "total_win_pnl": round(sum(float(p.get("pnl") or 0) for p in wins), 2),
+            },
+            "strategy_catalog": [
+                "swing_trend: EMA stack + SuperTrend + ADX continuation",
+                "breakout: 20d range break + volume expansion",
+                "intraday_mean_reversion: RSI/BB fade when ADX weak",
+            ],
+            "known_logic_gaps_to_consider": [
+                "Entered without ADX strength confirmation",
+                "Ignored elevated India VIX / macro risk-off",
+                "Stop too tight vs ATR → noise stop-out",
+                "No volume confirmation on breakout",
+                "Held into opposite EMA stack",
+                "Overtrading after consecutive losses",
+                "Duplicate/no-slot rejects while chasing same names",
+                "Slippage/fees eroded thin RR setups",
+            ],
+        }
 
-        api_key = os.getenv("QUANTX_OPENAI_API_KEY")
-        model = os.getenv("QUANTX_OPENAI_MODEL", "gpt-4o-mini")
-        system = (
-            "You are QuantX, an institutional paper-trading agent for NSE/BSE. "
-            "Capital preservation first. Answer clearly using the provided live context JSON. "
-            "If unsure, say so. Never encourage revenge trading or removing stops."
-        )
         slim = {
+            "intent": intent,
+            "question": question,
             "portfolio": ctx.get("portfolio"),
             "risk": ctx.get("risk"),
             "paper": ctx.get("paper"),
-            "positions": (ctx.get("positions") or [])[:10],
-            "orders": (ctx.get("orders") or [])[:15],
-            "cycles": (ctx.get("cycles") or [])[:5],
+            "macro": ctx.get("macro"),
+            "performance": ctx.get("performance"),
             "pnl_summary": (ctx.get("pnl") or {}).get("summary"),
+            "loss_review": loss_review,
+            "recent_orders": (ctx.get("orders") or [])[:20],
+            "recent_cycles": [
+                {
+                    "cycle_no": c.get("cycle_no"),
+                    "message": c.get("message"),
+                    "valid_count": c.get("valid_count"),
+                    "executed_count": c.get("executed_count"),
+                    "rejected_count": c.get("rejected_count"),
+                    "executed": c.get("executed"),
+                    "rejected": c.get("rejected"),
+                }
+                for c in (ctx.get("cycles") or [])[:8]
+            ],
+            "config_risk": (ctx.get("config") or {}).get("risk"),
         }
-        messages = [{"role": "system", "content": system + "\n\nLIVE_CONTEXT:\n" + json.dumps(slim, default=str)[:12000]}]
-        for h in history[-8:]:
+        return slim
+
+    def _call_llm(self, message: str, analysis_ctx: dict, history: list[dict], intent: str) -> str:
+        provider = self._resolve_provider()
+        model = self._resolve_model(provider)
+        api_key = self._resolve_api_key()
+        url = self._endpoint(provider)
+
+        intent_note = ""
+        if intent == "loss_review":
+            intent_note = (
+                "\nUser requested a dedicated LOSS REVIEW. Focus on losing trades, "
+                "missed filters, and strategy/logic gaps with prioritized fixes.\n"
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+                + intent_note
+                + "\n\nLIVE_TRADING_CONTEXT_JSON:\n"
+                + json.dumps(analysis_ctx, default=str)[:14000],
+            }
+        ]
+        for h in history[-10:]:
             if h.get("role") in ("user", "assistant") and h.get("content"):
-                messages.append({"role": h["role"], "content": h["content"]})
+                messages.append({"role": h["role"], "content": str(h["content"])[:4000]})
         messages.append({"role": "user", "content": message})
 
-        payload = json.dumps({"model": model, "messages": messages, "temperature": 0.2}).encode()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.25,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        if provider == "openrouter":
+            headers["HTTP-Referer"] = "https://quantx.local"
+            headers["X-Title"] = "QuantX Trading Agent"
+
         req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
+            url,
+            data=json.dumps(payload).encode(),
+            headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        content = data["choices"][0]["message"]["content"]
-        return self._reply(content, ctx)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            raise LLMProviderError(f"{provider} HTTP {e.code}: {body[:500]}") from e
+        except urllib.error.URLError as e:
+            raise LLMProviderError(f"{provider} connection error: {e}") from e
+
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise LLMProviderError(f"Unexpected LLM response: {data}") from e
+
+    def _pack(
+        self,
+        content: str,
+        mode: str = "llm",
+        error: Optional[str] = None,
+        analysis: Any = None,
+    ) -> dict:
+        cfg = self.get_llm_config()
+        return {
+            "role": "assistant",
+            "content": content,
+            "timestamp": _now(),
+            "mode": mode,
+            "provider": cfg.get("provider"),
+            "model": cfg.get("model") if mode == "llm" else None,
+            "error": error,
+            "analysis_stats": (analysis or {}).get("stats") if isinstance(analysis, dict) else None,
+            "sources": ["portfolio", "positions", "orders", "cycles", "journal", "risk", "macro"],
+        }
+
+    def _no_key_message(self) -> str:
+        return (
+            "**LLM chat is not configured yet.**\n\n"
+            "To enable strategy/loss reasoning with a real LLM:\n"
+            "1. Open **Chat → LLM settings**\n"
+            "2. Choose provider (**Groq** recommended / free tier, or OpenAI / OpenRouter)\n"
+            "3. Paste your API key and Save\n\n"
+            "Then ask: *“Why did we lose?”* or click **Analyze losses**.\n"
+        )
+
+    def _fallback_loss_brief(self, analysis_ctx: dict) -> str:
+        lr = analysis_ctx.get("loss_review") or {}
+        stats = lr.get("stats") or {}
+        lines = [
+            "**Structured loss brief (rules engine — enable LLM for deeper reasoning)**",
+            f"Closed trades: {stats.get('closed', 0)} | Wins: {stats.get('wins', 0)} | "
+            f"Losses: {stats.get('losses', 0)}",
+            f"Gross win PnL: ₹{stats.get('total_win_pnl', 0):,.2f} | "
+            f"Gross loss PnL: ₹{stats.get('total_loss_pnl', 0):,.2f}",
+            "",
+            "Losing trades:",
+        ]
+        losses = lr.get("losing_trades") or []
+        if not losses:
+            lines.append("• None in current book.")
+        for p in losses[:10]:
+            lines.append(
+                f"• {p.get('symbol')} {p.get('side')} entry {p.get('entry')} → exit {p.get('exit')} "
+                f"PnL ₹{float(p.get('pnl') or 0):,.2f} | {p.get('exit_reason')} | "
+                f"SL {p.get('stop_loss')} T1 {p.get('target_1')}"
+            )
+        lines.append("\nRecent rejects:")
+        rejs = lr.get("recent_rejections") or []
+        if not rejs:
+            lines.append("• None logged.")
+        for r in rejs[:8]:
+            lines.append(f"• Cycle #{r.get('cycle')} {r.get('symbol')}: {r.get('reason')}")
+        lines.append(
+            "\nLikely logic gaps to inspect once LLM is on: ADX/volume filters, VIX regime, "
+            "ATR stop distance, consecutive-loss halt adherence, fee drag on thin RR."
+        )
+        return "\n".join(lines)
+
+
+# Back-compat alias used by API
+QuantXChat = QuantXLLMChat
