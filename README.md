@@ -122,9 +122,22 @@ PYTHONPATH=backend python3 -m quantx.cli broker
 
 Live trading stays **off** until you set credentials and switch `agent.mode` to `live`.
 
+### LLM Chat (loss / strategy coach)
+LLM-first post-mortems on **why trades lost** and **what strategy/logic missed**.
+
+1. Dashboard **Chat** → **LLM settings** → pick **Groq/OpenAI/OpenRouter** → paste key → Save  
+2. Click **Analyze losses** (or ask “What did we miss?”)
+
+```bash
+export QUANTX_LLM_PROVIDER=groq
+export QUANTX_GROQ_API_KEY=your_key
+```
+
+`POST /api/chat` · `POST /api/chat/review-losses` · `GET|POST /api/chat/llm-config`
+
 ```
 backend/quantx/
-  core/          risk, sizing, engine, market hours, emergency
+  core/          risk, sizing, engine, market hours, emergency, chat
   analysis/      technical, fundamental, options, futures, macro
   data/          market data provider
   execution/     paper broker (duplicate-safe)
