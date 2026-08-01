@@ -150,6 +150,99 @@ def get_performance():
     return portfolio.performance()
 
 
+@app.get("/api/pnl")
+def get_pnl():
+    """Full P&L breakdown: summary + open (unrealized) + closed (realized) + order fills."""
+    # Refresh open MTM first so unrealized is current
+    try:
+        portfolio.mark_to_market()
+    except Exception:
+        logger.exception("MTM during /api/pnl failed")
+
+    snap = portfolio.snapshot()
+    perf = portfolio.performance()
+    opens = [p.model_dump(mode="json") for p in db.list_positions("OPEN")]
+    closed = [p.model_dump(mode="json") for p in db.list_positions("CLOSED")]
+    journal = [j.model_dump(mode="json") for j in db.list_journal(200)]
+    orders = db.list_orders(200)
+
+    # Enrich FILLED orders with linked position PnL when possible
+    pos_by_sym = {}
+    for p in opens + closed:
+        pos_by_sym.setdefault(p["symbol"], []).append(p)
+
+    order_rows = []
+    for o in orders:
+        linked = None
+        cands = pos_by_sym.get(o["symbol"] or "", [])
+        # Prefer matching side + similar entry price
+        for p in cands:
+            if p.get("side") == o.get("side") and abs(float(p.get("entry_price") or 0) - float(o.get("price") or 0)) < 1.0:
+                linked = p
+                break
+        if linked is None and cands:
+            linked = cands[0]
+
+        unrealized = None
+        realized = None
+        status_pos = None
+        entry = o.get("price")
+        exit_px = None
+        if linked:
+            status_pos = linked.get("status")
+            if linked.get("status") == "OPEN":
+                unrealized = linked.get("pnl")
+            else:
+                realized = linked.get("pnl")
+                exit_px = linked.get("exit_price")
+
+        order_rows.append(
+            {
+                **o,
+                "position_status": status_pos,
+                "entry_price": entry,
+                "exit_price": exit_px,
+                "unrealized_pnl": unrealized,
+                "realized_pnl": realized,
+                "pnl": realized if realized is not None else unrealized,
+                "pnl_pct": linked.get("pnl_pct") if linked else None,
+                "stop_loss": linked.get("stop_loss") if linked else None,
+                "target_1": linked.get("target_1") if linked else None,
+                "target_2": linked.get("target_2") if linked else None,
+                "exit_reason": linked.get("exit_reason") if linked else None,
+            }
+        )
+
+    open_unrealized = sum(float(p.get("pnl") or 0) for p in opens)
+    closed_realized = sum(float(p.get("pnl") or 0) for p in closed)
+    wins = [p for p in closed if float(p.get("pnl") or 0) > 0]
+    losses = [p for p in closed if float(p.get("pnl") or 0) <= 0]
+
+    return {
+        "summary": {
+            "capital": snap.capital,
+            "initial_capital": settings.capital.initial,
+            "total_pnl": snap.total_pnl,
+            "realized_pnl_today": snap.realized_pnl_today,
+            "realized_pnl_week": snap.realized_pnl_week,
+            "unrealized_pnl": round(open_unrealized, 2),
+            "closed_realized_pnl": round(closed_realized, 2),
+            "total_fees": perf.get("total_fees", 0),
+            "drawdown_pct": snap.drawdown_pct,
+            "open_positions": len(opens),
+            "closed_trades": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / len(closed) * 100, 2) if closed else 0.0,
+            "mode": snap.mode,
+        },
+        "open_positions": opens,
+        "closed_positions": closed,
+        "journal": journal,
+        "orders": order_rows,
+    }
+
+
 @app.get("/api/risk")
 def get_risk():
     portfolio._hydrate_risk_from_db()

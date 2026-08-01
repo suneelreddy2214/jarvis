@@ -67,7 +67,7 @@ export default function App() {
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
-  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles'>('overview')
+  const [tab, setTab] = useState<'overview' | 'orders' | 'cycles' | 'pnl'>('overview')
   const [orders, setOrders] = useState<
     Array<{
       id: number
@@ -96,10 +96,11 @@ export default function App() {
       created_at: string
     }>
   >([])
+  const [pnlData, setPnlData] = useState<Awaited<ReturnType<typeof api.pnl>> | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc] = await Promise.all([
+      const [p, r, s, pos, j, w, e, paper, performance, ords, cyc, pnl] = await Promise.all([
         api.portfolio(),
         api.risk(),
         api.session(),
@@ -111,6 +112,7 @@ export default function App() {
         api.performance(),
         api.orders(),
         api.cycles(),
+        api.pnl(),
       ])
       setPortfolio(p)
       setRisk(r)
@@ -130,6 +132,7 @@ export default function App() {
       setPerf(performance)
       setOrders(ords)
       setCycles(cyc)
+      setPnlData(pnl)
     } catch (err) {
       setStatus(`Backend offline — start API on :8000 (${(err as Error).message})`)
     }
@@ -414,6 +417,9 @@ export default function App() {
         <button className={`tab${tab === 'orders' ? ' active' : ''}`} onClick={() => setTab('orders')} type="button">
           Orders<span className="count">{orders.length}</span>
         </button>
+        <button className={`tab${tab === 'pnl' ? ' active' : ''}`} onClick={() => setTab('pnl')} type="button">
+          P&amp;L<span className="count">{pnlData ? (pnlData.summary.open_positions + pnlData.summary.closed_trades) : 0}</span>
+        </button>
         <button className={`tab${tab === 'cycles' ? ' active' : ''}`} onClick={() => setTab('cycles')} type="button">
           Cycles<span className="count">{paperStats.cycles || cycles.length}</span>
         </button>
@@ -464,6 +470,223 @@ export default function App() {
             </table>
           )}
         </section>
+      )}
+
+      {tab === 'pnl' && (
+        <div className="stack" style={{ marginBottom: '1rem' }}>
+          <section className="panel">
+            <div className="panel-head">
+              <h2>P&amp;L Summary</h2>
+              <div className="actions">
+                <button className="btn" disabled={busy} onClick={refresh}>
+                  Refresh MTM
+                </button>
+              </div>
+            </div>
+            {!pnlData ? (
+              <p className="empty">Loading P&amp;L…</p>
+            ) : (
+              <>
+                <div className="rec-grid">
+                  <div className="rec-cell">
+                    <span>Total P&amp;L</span>
+                    <strong className={pnlData.summary.total_pnl >= 0 ? 'pos' : 'neg'}>
+                      {inr(pnlData.summary.total_pnl)}
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Unrealized</span>
+                    <strong className={pnlData.summary.unrealized_pnl >= 0 ? 'pos' : 'neg'}>
+                      {inr(pnlData.summary.unrealized_pnl)}
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Realized (closed)</span>
+                    <strong className={pnlData.summary.closed_realized_pnl >= 0 ? 'pos' : 'neg'}>
+                      {inr(pnlData.summary.closed_realized_pnl)}
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Fees</span>
+                    <strong className="warn">{inr(pnlData.summary.total_fees)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Capital</span>
+                    <strong>{inr(pnlData.summary.capital)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Drawdown</span>
+                    <strong className={pnlData.summary.drawdown_pct > 2 ? 'warn' : ''}>
+                      {pnlData.summary.drawdown_pct.toFixed(2)}%
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Win rate</span>
+                    <strong>
+                      {pnlData.summary.win_rate.toFixed(1)}% ({pnlData.summary.wins}W / {pnlData.summary.losses}L)
+                    </strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Open / Closed</span>
+                    <strong>
+                      {pnlData.summary.open_positions} / {pnlData.summary.closed_trades}
+                    </strong>
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Order-level P&amp;L</h2>
+            </div>
+            {!pnlData || pnlData.orders.length === 0 ? (
+              <p className="empty">No filled orders with P&amp;L yet.</p>
+            ) : (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>LTP / Exit</th>
+                    <th>SL</th>
+                    <th>T1</th>
+                    <th>Pos</th>
+                    <th>P&amp;L</th>
+                    <th>%</th>
+                    <th>Exit reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pnlData.orders
+                    .filter((o) => o.status === 'FILLED')
+                    .map((o) => {
+                      const pnlVal = o.pnl ?? 0
+                      const mark = o.exit_price ?? o.entry_price
+                      return (
+                        <tr key={`pnl-ord-${o.id}`}>
+                          <td style={{ whiteSpace: 'nowrap' }}>{(o.created_at || '').replace('T', ' ').slice(0, 19)}</td>
+                          <td>{o.symbol}</td>
+                          <td>
+                            <span className={`pill ${o.side === 'BUY' ? 'buy' : 'sell'}`}>{o.side}</span>
+                          </td>
+                          <td>{o.quantity}</td>
+                          <td>{Number(o.entry_price ?? o.price).toFixed(2)}</td>
+                          <td>{mark != null ? Number(mark).toFixed(2) : '—'}</td>
+                          <td>{o.stop_loss != null ? Number(o.stop_loss).toFixed(2) : '—'}</td>
+                          <td>{o.target_1 != null ? Number(o.target_1).toFixed(2) : '—'}</td>
+                          <td>
+                            <span className={`pill ${o.position_status === 'OPEN' ? 'valid' : 'invalid'}`}>
+                              {o.position_status || '—'}
+                            </span>
+                          </td>
+                          <td className={pnlVal >= 0 ? 'pos' : 'neg'}>{inr(pnlVal)}</td>
+                          <td className={(o.pnl_pct ?? 0) >= 0 ? 'pos' : 'neg'}>
+                            {o.pnl_pct != null ? pct(o.pnl_pct) : '—'}
+                          </td>
+                          <td style={{ fontFamily: 'var(--font)', color: 'var(--muted)' }}>
+                            {o.exit_reason || (o.position_status === 'OPEN' ? 'Open — unrealized' : '—')}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                </tbody>
+              </table>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Open positions (unrealized)</h2>
+            </div>
+            {!pnlData || pnlData.open_positions.length === 0 ? (
+              <p className="empty">No open positions.</p>
+            ) : (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>LTP</th>
+                    <th>SL</th>
+                    <th>T1 / T2</th>
+                    <th>Unrealized</th>
+                    <th>%</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pnlData.open_positions.map((p) => (
+                    <tr key={`open-${p.id}`}>
+                      <td>{p.symbol}</td>
+                      <td>
+                        <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
+                      </td>
+                      <td>{p.quantity}</td>
+                      <td>{p.entry_price.toFixed(2)}</td>
+                      <td>{p.current_price.toFixed(2)}</td>
+                      <td>{p.stop_loss.toFixed(2)}</td>
+                      <td>
+                        {p.target_1.toFixed(2)} / {p.target_2.toFixed(2)}
+                      </td>
+                      <td className={p.pnl >= 0 ? 'pos' : 'neg'}>{inr(p.pnl)}</td>
+                      <td className={p.pnl_pct >= 0 ? 'pos' : 'neg'}>{pct(p.pnl_pct)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>Closed trades (realized)</h2>
+            </div>
+            {!pnlData || pnlData.closed_positions.length === 0 ? (
+              <p className="empty">No closed trades yet.</p>
+            ) : (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>Realized P&amp;L</th>
+                    <th>%</th>
+                    <th>Reason</th>
+                    <th>Closed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pnlData.closed_positions.map((p) => (
+                    <tr key={`closed-${p.id}`}>
+                      <td>{p.symbol}</td>
+                      <td>
+                        <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
+                      </td>
+                      <td>{p.quantity}</td>
+                      <td>{p.entry_price.toFixed(2)}</td>
+                      <td>{p.exit_price != null ? Number(p.exit_price).toFixed(2) : '—'}</td>
+                      <td className={p.pnl >= 0 ? 'pos' : 'neg'}>{inr(p.pnl)}</td>
+                      <td className={p.pnl_pct >= 0 ? 'pos' : 'neg'}>{pct(p.pnl_pct)}</td>
+                      <td style={{ fontFamily: 'var(--font)', color: 'var(--muted)' }}>{p.exit_reason || '—'}</td>
+                      <td style={{ whiteSpace: 'nowrap' }}>
+                        {p.closed_at ? String(p.closed_at).replace('T', ' ').slice(0, 19) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+        </div>
       )}
 
       {tab === 'cycles' && (

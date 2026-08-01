@@ -66,6 +66,11 @@ export type Position = {
   status: string
   confidence: number
   reason: string
+  exit_price?: number | null
+  exit_reason?: string | null
+  closed_at?: string | null
+  opened_at?: string
+  capital_at_risk?: number
 }
 
 export type RiskStatus = {
@@ -226,6 +231,50 @@ export const api = {
         created_at: string
       }>
     >('/api/orders'),
+  pnl: () =>
+    req<{
+      summary: {
+        capital: number
+        initial_capital: number
+        total_pnl: number
+        realized_pnl_today: number
+        realized_pnl_week: number
+        unrealized_pnl: number
+        closed_realized_pnl: number
+        total_fees: number
+        drawdown_pct: number
+        open_positions: number
+        closed_trades: number
+        wins: number
+        losses: number
+        win_rate: number
+        mode: string
+      }
+      open_positions: Position[]
+      closed_positions: Position[]
+      journal: JournalEntry[]
+      orders: Array<{
+        id: number
+        symbol: string
+        side: string
+        quantity: number
+        price: number
+        status: string
+        message: string
+        created_at: string
+        position_status?: string | null
+        entry_price?: number | null
+        exit_price?: number | null
+        unrealized_pnl?: number | null
+        realized_pnl?: number | null
+        pnl?: number | null
+        pnl_pct?: number | null
+        stop_loss?: number | null
+        target_1?: number | null
+        target_2?: number | null
+        exit_reason?: string | null
+      }>
+    }>('/api/pnl'),
   cycles: () =>
     req<
       Array<{
