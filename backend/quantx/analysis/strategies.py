@@ -24,6 +24,9 @@ class StrategySignal:
 class Strategy(ABC):
     name: str
     trade_type: TradeType
+    family: str = "core"
+    phase: int = 1
+    description: str = ""
 
     @abstractmethod
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
@@ -35,6 +38,8 @@ class SwingTrendStrategy(Strategy):
 
     name = "swing_trend"
     trade_type = TradeType.SWING
+    family = "trend"
+    description = "EMA stack + SuperTrend swing continuation"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         tags: list[str] = []
@@ -71,6 +76,8 @@ class IntradayMeanReversionStrategy(Strategy):
 
     name = "intraday_mean_reversion"
     trade_type = TradeType.INTRADAY
+    family = "mean_reversion"
+    description = "RSI + Bollinger fade on weak ADX"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         tags: list[str] = []
@@ -102,6 +109,8 @@ class BreakoutStrategy(Strategy):
 
     name = "breakout"
     trade_type = TradeType.SWING
+    family = "breakout"
+    description = "20-day range breakout with volume"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         tags: list[str] = []
@@ -136,6 +145,8 @@ class FuturesTrendStrategy(Strategy):
 
     name = "futures_trend"
     trade_type = TradeType.FUTURES
+    family = "trend"
+    description = "Futures trend following with EMA + SuperTrend"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         tags: list[str] = []
@@ -152,7 +163,6 @@ class FuturesTrendStrategy(Strategy):
                 side = Side.SELL
                 tags += ["fut_short", "ema_supertrend"]
                 boost += 6
-        # Softer fallback: clear trend + ADX without full EMA stack
         if side is None and snap.adx >= 22:
             if snap.trend == MarketDirection.BULLISH and snap.supertrend_dir == 1:
                 side = Side.BUY
@@ -181,6 +191,8 @@ class OptionsDirectionalStrategy(Strategy):
 
     name = "options_directional"
     trade_type = TradeType.OPTIONS
+    family = "options_buy"
+    description = "Long call/put directional option buying"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         tags: list[str] = []
@@ -189,12 +201,12 @@ class OptionsDirectionalStrategy(Strategy):
 
         if snap.trend == MarketDirection.BULLISH and snap.momentum in ("up", "strong_up", "neutral"):
             if snap.supertrend_dir == 1 and snap.ema_9 >= snap.ema_21 * 0.998:
-                side = Side.BUY  # long CE (encoded in engine)
+                side = Side.BUY
                 tags += ["long_ce", "trend_up"]
                 boost += 6
         elif snap.trend == MarketDirection.BEARISH and snap.momentum in ("down", "strong_down", "neutral"):
             if snap.supertrend_dir == -1 and snap.ema_9 <= snap.ema_21 * 1.002:
-                side = Side.SELL  # signals PE buy; engine converts to BUY option
+                side = Side.SELL
                 tags += ["long_pe", "trend_down"]
                 boost += 6
 
@@ -223,6 +235,13 @@ STRATEGIES: dict[str, Strategy] = {
 }
 
 
+def register_strategy(strategy: Strategy) -> None:
+    """Register an additional strategy without replacing existing names."""
+    if strategy.name in STRATEGIES:
+        return
+    STRATEGIES[strategy.name] = strategy
+
+
 def get_strategy(name: str) -> Strategy:
     key = name.strip().lower()
     if key not in STRATEGIES:
@@ -232,6 +251,14 @@ def get_strategy(name: str) -> Strategy:
 
 def list_strategies() -> list[dict]:
     return [
-        {"name": s.name, "trade_type": s.trade_type.value, "class": s.__class__.__name__}
+        {
+            "name": s.name,
+            "trade_type": s.trade_type.value,
+            "class": s.__class__.__name__,
+            "family": getattr(s, "family", "core"),
+            "phase": getattr(s, "phase", 1),
+            "description": getattr(s, "description", ""),
+        }
         for s in STRATEGIES.values()
     ]
+

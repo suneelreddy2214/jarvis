@@ -12,7 +12,11 @@ from pydantic import BaseModel, Field
 
 from quantx import __version__
 from quantx.analysis.backtest import Backtester
+from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
 from quantx.analysis.strategies import list_strategies
+import quantx.analysis.additional_strategies  # noqa: F401 — register additive strategies
+from quantx.analysis.learning import StrategyLearner
+from quantx.analysis.regime import RegimeDetector
 from quantx.core.chat import QuantXChat
 from quantx.core.config import get_settings
 from quantx.core.emergency import EmergencyController
@@ -22,7 +26,6 @@ from quantx.core.models import TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST, MarketDataService
 from quantx.execution.base import PaperBrokerAdapter, broker_credentials_present
 from quantx.execution.broker import PaperBroker
-from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
 from quantx.execution.paper_agent import DEFAULT_PAPER_UNIVERSE, get_paper_agent
 from quantx.portfolio.db import Database
 from quantx.portfolio.manager import PortfolioManager
@@ -181,6 +184,12 @@ class PaperStartRequest(BaseModel):
 
 class PaperResetRequest(BaseModel):
     confirm: bool = False
+
+
+class PaperCapitalRequest(BaseModel):
+    delta: Optional[float] = None
+    set_to: Optional[float] = None
+    reason: str = "Dashboard capital adjust"
 
 
 class BacktestRequest(BaseModel):
@@ -419,7 +428,51 @@ def execute(req: ExecuteRequest):
 
 @app.get("/api/strategies")
 def strategies():
-    return list_strategies()
+    return {
+        "count": len(list_strategies()),
+        "strategies": list_strategies(),
+        "learning": StrategyLearner(db).as_dict(),
+        "note": "Core strategies preserved; additional strategies registered additively.",
+    }
+
+
+@app.get("/api/regime")
+def get_regime():
+    macro_snap = market_data.get_macro_snapshot()
+    macro = engine.macro.analyze(
+        nifty_change_pct=macro_snap.get("nifty_change_pct"),
+        india_vix=macro_snap.get("india_vix"),
+        usdinr_change_pct=macro_snap.get("usdinr_change_pct"),
+    )
+    snap = None
+    try:
+        snap = engine.ta.analyze(market_data.get_ohlc("NIFTY", "NSE"))
+    except Exception:
+        snap = None
+    regime = RegimeDetector().detect(
+        snap=snap,
+        india_vix=macro_snap.get("india_vix"),
+        avoid_new_risk=macro.avoid_new_risk,
+    )
+    return {
+        "regime": regime.as_dict(),
+        "macro": {
+            "summary": macro.summary,
+            "avoid_new_risk": macro.avoid_new_risk,
+            "india_vix": macro_snap.get("india_vix"),
+        },
+    }
+
+
+@app.get("/api/learning")
+def get_learning():
+    learner = StrategyLearner(db)
+    # Soft sync from journal so UI has data even before new closes
+    try:
+        learner.sync_from_journal(db.list_journal(500))
+    except Exception:
+        pass
+    return learner.as_dict()
 
 
 @app.post("/api/backtest")
@@ -523,6 +576,23 @@ def paper_reset(req: PaperResetRequest):
     if not result.get("ok"):
         raise HTTPException(400, result.get("message", "Reset refused"))
     return result
+
+
+@app.post("/api/paper/capital")
+def paper_capital(req: PaperCapitalRequest):
+    """Increase / decrease / set paper capital without wiping trade history."""
+    if req.delta is None and req.set_to is None:
+        raise HTTPException(400, "Provide delta or set_to")
+    if req.delta is not None and req.set_to is not None:
+        raise HTTPException(400, "Provide only one of delta or set_to")
+    try:
+        return portfolio.adjust_capital(
+            delta=float(req.delta or 0),
+            set_to=req.set_to,
+            reason=req.reason,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/journal")

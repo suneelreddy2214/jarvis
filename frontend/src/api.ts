@@ -421,7 +421,61 @@ export const api = {
         created_at: string
       }>
     >('/api/paper/cycles'),
-  strategies: () => req<Array<{ name: string; trade_type: string; class: string }>>('/api/strategies'),
+  strategies: () =>
+    req<{
+      count: number
+      strategies: Array<{
+        name: string
+        trade_type: string
+        class: string
+        family?: string
+        phase?: number
+        description?: string
+      }>
+      learning?: Record<string, unknown>
+      note?: string
+    }>('/api/strategies'),
+  regime: () =>
+    req<{
+      regime: {
+        regime: string
+        confidence: number
+        summary: string
+        preferred_families: string[]
+        adx: number
+        atr_pct: number
+        vix?: number | null
+      }
+      macro: { summary: string; avoid_new_risk: boolean; india_vix?: number }
+    }>('/api/regime'),
+  learning: () =>
+    req<{
+      updates: number
+      leaderboard: Array<{
+        strategy: string
+        trades: number
+        wins: number
+        losses: number
+        win_rate: number
+        pnl: number
+        weight: number
+      }>
+      weights: Record<string, number>
+      mode: string
+      note: string
+    }>('/api/learning'),
+  paperAdjustCapital: (opts: { delta?: number; set_to?: number; reason?: string }) =>
+    req<{
+      ok: boolean
+      before: number
+      after: number
+      delta: number
+      reason: string
+      portfolio: PortfolioSnapshot
+    }>('/api/paper/capital', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
   backtest: (symbol: string, strategy = 'swing_trend', period = '1y') =>
     req<{
       strategy: string

@@ -15,12 +15,18 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
+from quantx.analysis.learning import StrategyLearner
+from quantx.analysis.regime import RegimeDetector
+from quantx.analysis.selector import select_strategies_for_regime
 from quantx.core.config import Settings, get_settings
 from quantx.core.engine import QuantXEngine
 from quantx.core.models import TradeRecommendation, TradeType
 from quantx.data.market_data import DEFAULT_WATCHLIST
 from quantx.execution.broker import PaperBroker
 from quantx.portfolio.manager import PortfolioManager
+
+# Ensure additive strategies are registered
+import quantx.analysis.additional_strategies  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,9 @@ class SessionStats:
     trade_type: str = "SWING"
     trade_types: list[str] = field(default_factory=lambda: ["SWING"])
     enable_fno: bool = False
+    use_regime_selector: bool = True
+    last_regime: Optional[str] = None
+    last_strategies: list[str] = field(default_factory=list)
 
 
 class PaperTradingAgent:
@@ -102,6 +111,9 @@ class PaperTradingAgent:
                 "trade_type": self.stats.trade_type,
                 "trade_types": self.stats.trade_types,
                 "enable_fno": self.stats.enable_fno,
+                "use_regime_selector": self.stats.use_regime_selector,
+                "last_regime": self.stats.last_regime,
+                "last_strategies": self.stats.last_strategies,
                 "started_at": self.stats.started_at,
                 "stopped_at": self.stats.stopped_at,
                 "cycles": self.stats.cycles,
@@ -215,6 +227,7 @@ class PaperTradingAgent:
         )
         self.portfolio._persist_risk()
         self.portfolio.db.set_state("total_fees", 0.0)
+        self.portfolio.db.set_state("capital_basis", initial)
         self.portfolio.db.set_state("paper_reset_at", datetime.utcnow().isoformat() + "Z")
         self.stats = SessionStats()
         return {"ok": True, "message": f"Paper account reset to ₹{initial:,.0f}", **self.status()}
@@ -252,6 +265,35 @@ class PaperTradingAgent:
             return "intraday_mean_reversion"
         return None  # default TA path / swing
 
+    def _detect_regime(self):
+        macro_snap = self.portfolio.data.get_macro_snapshot()
+        macro = self.engine.macro.analyze(
+            nifty_change_pct=macro_snap.get("nifty_change_pct"),
+            india_vix=macro_snap.get("india_vix"),
+            usdinr_change_pct=macro_snap.get("usdinr_change_pct"),
+        )
+        # Use NIFTY snapshot for technical regime when possible
+        snap = None
+        try:
+            df = self.portfolio.data.get_ohlc("NIFTY", "NSE")
+            snap = self.engine.ta.analyze(df)
+        except Exception:
+            snap = None
+        return RegimeDetector().detect(
+            snap=snap,
+            india_vix=macro_snap.get("india_vix"),
+            avoid_new_risk=macro.avoid_new_risk,
+        )
+
+    def _strategies_for(self, trade_type: str, regime) -> list[str]:
+        if not self.stats.use_regime_selector:
+            s = self._strategy_for(trade_type)
+            return [s] if s else ["swing_trend"]
+        learner = StrategyLearner(self.portfolio.db)
+        return select_strategies_for_regime(
+            regime, trade_type, learner=learner, limit=3
+        )
+
     def _cycle(self) -> dict:
         self.stats.cycles += 1
         self.stats.last_cycle_at = datetime.utcnow().isoformat() + "Z"
@@ -283,23 +325,40 @@ class PaperTradingAgent:
                 self._on_cycle(result)
             return result
 
-        # 2) Scan all enabled products
+        # 2) Scan all enabled products with regime-selected strategies
         types = self.stats.trade_types or [self.stats.trade_type]
+        regime = self._detect_regime()
+        self.stats.last_regime = regime.regime.value
+        used_strategies: list[str] = []
         recs: list[TradeRecommendation] = []
         for tt in types:
             try:
-                batch = self.engine.scan_watchlist(
-                    self._symbols_for(tt),
-                    "NSE",
-                    TradeType(tt),
-                    strategy=self._strategy_for(tt),
-                )
-                recs.extend(batch)
+                strat_names = self._strategies_for(tt, regime)
+                used_strategies.extend(strat_names)
+                for strat_name in strat_names:
+                    batch = self.engine.scan_watchlist(
+                        self._symbols_for(tt),
+                        "NSE",
+                        TradeType(tt),
+                        strategy=strat_name,
+                    )
+                    recs.extend(batch)
             except Exception as e:
                 logger.exception("Scan failed for trade_type=%s", tt)
                 self.stats.last_message = f"scan error ({tt}): {e}"
 
+        # Dedupe by symbol+trade_type keeping highest confidence
+        best: dict[tuple[str, str], TradeRecommendation] = {}
+        for r in recs:
+            key = (r.symbol, r.trade_type.value)
+            prev = best.get(key)
+            if prev is None or (r.valid and not prev.valid) or (
+                r.valid == prev.valid and r.scores.confidence > prev.scores.confidence
+            ):
+                best[key] = r
+        recs = list(best.values())
         recs.sort(key=lambda r: (not r.valid, -r.scores.confidence))
+        self.stats.last_strategies = sorted(set(used_strategies))
         self.stats.scanned += len(recs)
         valid = [r for r in recs if r.valid]
         self.stats.valid_signals += len(valid)
@@ -384,8 +443,9 @@ class PaperTradingAgent:
                     self.stats.rejected += 1
 
         msg = (
-            f"Cycle #{self.stats.cycles}: MTM closed {closed}, "
-            f"valid {len(valid)}/{len(recs)} ({','.join(types)}), "
+            f"Cycle #{self.stats.cycles}: regime={regime.regime.value}, "
+            f"strats={','.join(self.stats.last_strategies[:5])}, "
+            f"MTM closed {closed}, valid {len(valid)}/{len(recs)}, "
             f"executed {len(executed)}, rejected {len(rejected)}"
         )
         self.stats.last_message = msg
@@ -403,6 +463,8 @@ class PaperTradingAgent:
             "rejected_count": len(rejected),
             "trade_types": types,
             "enable_fno": self.stats.enable_fno,
+            "regime": regime.as_dict(),
+            "strategies_used": self.stats.last_strategies,
             "message": msg,
             "portfolio": self.portfolio.snapshot().model_dump(),
             "margin": self.portfolio.margin_book(),

@@ -91,8 +91,9 @@ class PortfolioManager:
         self._hydrate_risk_from_db()
         opens = self.db.list_positions("OPEN")
         unrealized = sum(p.pnl for p in opens)
-        total_pnl = (self.risk.state.capital + unrealized) - self.settings.capital.initial
         book = MarginCalculator().build_book(self.risk.state.capital, opens)
+        basis = float(self.db.get_state("capital_basis", self.settings.capital.initial))
+        total_pnl = (self.risk.state.capital + unrealized) - basis
         return PortfolioSnapshot(
             capital=self.risk.state.capital,
             available_margin=round(book.available_margin, 2),
@@ -304,7 +305,54 @@ class PortfolioManager:
             closed_at=p.closed_at or datetime.utcnow(),
         )
         self.db.insert_journal(entry)
+        # Online learning: adapt strategy weights from outcomes
+        try:
+            from quantx.analysis.learning import StrategyLearner, extract_strategy_name
+
+            StrategyLearner(self.db).record_trade(extract_strategy_name(p.reason), p.pnl)
+        except Exception:
+            pass
         return p
+
+    def adjust_capital(
+        self,
+        delta: float = 0.0,
+        set_to: Optional[float] = None,
+        reason: str = "Manual paper capital adjust",
+    ) -> dict:
+        """Increase or decrease paper capital (or set absolute). Does not wipe history."""
+        self._hydrate_risk_from_db()
+        before = float(self.risk.state.capital)
+        if set_to is not None:
+            after = float(set_to)
+        else:
+            after = before + float(delta)
+        if after < 10_000:
+            raise ValueError("Paper capital cannot go below ₹10,000")
+        if after > 1_000_000_000:
+            raise ValueError("Paper capital cannot exceed ₹100 crore")
+        peak = max(float(self.risk.state.peak_capital), after)
+        self.risk.update_state(capital=after, peak_capital=peak)
+        self._persist_risk()
+        basis = float(self.db.get_state("capital_basis", self.settings.capital.initial))
+        self.db.set_state("capital_basis", basis + (after - before))
+        self.db.set_state(
+            "capital_adjust_log",
+            {
+                "before": before,
+                "after": after,
+                "delta": after - before,
+                "reason": reason,
+            },
+        )
+        return {
+            "ok": True,
+            "before": round(before, 2),
+            "after": round(after, 2),
+            "delta": round(after - before, 2),
+            "reason": reason,
+            "portfolio": self.snapshot().model_dump(),
+        }
 
     def performance(self) -> dict:
         journal = self.db.list_journal(500)
@@ -318,6 +366,13 @@ class PortfolioManager:
             avg_win * (win_rate / 100) + avg_loss * (1 - win_rate / 100) if journal else 0.0
         )
         snap = self.snapshot()
+        learning = {}
+        try:
+            from quantx.analysis.learning import StrategyLearner
+
+            learning = StrategyLearner(self.db).as_dict()
+        except Exception:
+            learning = {}
         return {
             "trades": len(journal),
             "wins": len(wins),
@@ -331,6 +386,7 @@ class PortfolioManager:
             "capital": snap.capital,
             "drawdown_pct": snap.drawdown_pct,
             "open_positions": snap.open_positions,
+            "strategy_learning": learning,
         }
 
     def panic_exit_all(self) -> list[Position]:

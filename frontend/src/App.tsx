@@ -67,6 +67,14 @@ export default function App() {
   const [strategy, setStrategy] = useState('swing_trend')
   const [enableFno, setEnableFno] = useState(true)
   const [scanProduct, setScanProduct] = useState<'ALL' | 'SWING' | 'FUTURES' | 'OPTIONS'>('ALL')
+  const [capitalDelta, setCapitalDelta] = useState('100000')
+  const [regimeInfo, setRegimeInfo] = useState<{
+    regime: string
+    summary: string
+    confidence: number
+  } | null>(null)
+  const [strategyCount, setStrategyCount] = useState(0)
+  const [learningTop, setLearningTop] = useState<Array<{ strategy: string; weight: number; win_rate: number; pnl: number }>>([])
   const [btSymbol, setBtSymbol] = useState('RELIANCE')
   const [btResult, setBtResult] = useState<string>('')
   const [brokerInfo, setBrokerInfo] = useState('')
@@ -163,6 +171,18 @@ export default function App() {
       setCycles(cyc)
       setPnlData(pnl)
       setMarginBook(margin)
+      try {
+        const [reg, stratPack, learn] = await Promise.all([api.regime(), api.strategies(), api.learning()])
+        setRegimeInfo({
+          regime: reg.regime.regime,
+          summary: reg.regime.summary,
+          confidence: reg.regime.confidence,
+        })
+        setStrategyCount(stratPack.count)
+        setLearningTop((learn.leaderboard || []).slice(0, 5))
+      } catch {
+        /* optional */
+      }
       try {
         const cfg = await api.llmConfig()
         setLlmCfg(cfg)
@@ -359,6 +379,37 @@ export default function App() {
       setStatus(`LLM config failed: ${(err as Error).message}`)
     } finally {
       setChatBusy(false)
+    }
+  }
+
+  const adjustCapital = async (delta: number) => {
+    setBusy(true)
+    try {
+      const res = await api.paperAdjustCapital({ delta, reason: 'Dashboard capital adjust' })
+      setStatus(`Paper capital ${delta >= 0 ? 'increased' : 'decreased'}: ${inr(res.before)} → ${inr(res.after)}`)
+      await refresh()
+    } catch (err) {
+      setStatus(`Capital adjust failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const setCapitalAbsolute = async () => {
+    const n = Number(capitalDelta)
+    if (!Number.isFinite(n) || n < 10000) {
+      setStatus('Enter a valid capital amount (≥ ₹10,000)')
+      return
+    }
+    setBusy(true)
+    try {
+      const res = await api.paperAdjustCapital({ set_to: n, reason: 'Dashboard set capital' })
+      setStatus(`Paper capital set to ${inr(res.after)}`)
+      await refresh()
+    } catch (err) {
+      setStatus(`Set capital failed: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -1421,6 +1472,68 @@ export default function App() {
               />
               Auto-trade F&amp;O with Stocks
             </label>
+
+            <div className="panel-head" style={{ marginTop: '1rem' }}>
+              <h2 style={{ fontSize: '1rem' }}>Paper Capital</h2>
+            </div>
+            <div className="rec-grid">
+              <div className="rec-cell">
+                <span>Current</span>
+                <strong>{portfolio ? inr(portfolio.capital) : '—'}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Strategies loaded</span>
+                <strong>{strategyCount || '—'}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Regime</span>
+                <strong>{regimeInfo?.regime || '—'}</strong>
+              </div>
+              <div className="rec-cell">
+                <span>Regime conf</span>
+                <strong>{regimeInfo ? `${regimeInfo.confidence.toFixed(0)}%` : '—'}</strong>
+              </div>
+            </div>
+            <div className="actions" style={{ marginTop: '0.65rem', flexWrap: 'wrap', gap: '0.4rem' }}>
+              <button className="btn" type="button" disabled={busy} onClick={() => void adjustCapital(100_000)}>
+                + ₹1L
+              </button>
+              <button className="btn" type="button" disabled={busy} onClick={() => void adjustCapital(500_000)}>
+                + ₹5L
+              </button>
+              <button className="btn" type="button" disabled={busy} onClick={() => void adjustCapital(1_000_000)}>
+                + ₹10L
+              </button>
+              <button className="btn warn" type="button" disabled={busy} onClick={() => void adjustCapital(-100_000)}>
+                − ₹1L
+              </button>
+              <button className="btn warn" type="button" disabled={busy} onClick={() => void adjustCapital(-500_000)}>
+                − ₹5L
+              </button>
+            </div>
+            <div className="scan-row" style={{ marginTop: '0.5rem' }}>
+              <input
+                value={capitalDelta}
+                onChange={(e) => setCapitalDelta(e.target.value)}
+                placeholder="Set capital (INR)"
+              />
+              <button className="btn primary" type="button" disabled={busy} onClick={() => void setCapitalAbsolute()}>
+                Set Capital
+              </button>
+            </div>
+            {regimeInfo && (
+              <p className="prose" style={{ marginTop: '0.75rem' }}>
+                <strong>Regime.</strong> {regimeInfo.summary}
+              </p>
+            )}
+            {learningTop.length > 0 && (
+              <p className="prose">
+                <strong>Self-training top.</strong>{' '}
+                {learningTop
+                  .map((r) => `${r.strategy} (w=${r.weight.toFixed(2)}, wr=${r.win_rate.toFixed(0)}%)`)
+                  .join(' · ')}
+              </p>
+            )}
             <p className="prose" style={{ marginTop: '0.75rem' }}>
               <strong>Last cycle.</strong> {paperMsg}
             </p>
