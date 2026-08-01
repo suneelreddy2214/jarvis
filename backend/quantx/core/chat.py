@@ -92,13 +92,12 @@ class QuantXLLMChat:
             raise ValueError("provider must be openai|groq|openrouter")
         if not self._store:
             raise RuntimeError("No settings store configured")
-        if api_key:
-            self._store("set", "llm_api_key", api_key)
-            self._store("set", "llm_provider", provider)
-            if model:
-                self._store("set", "llm_model", model)
-        else:
-            self._store("set", "llm_api_key", "")
+        self._store("set", "llm_provider", provider)
+        if model:
+            self._store("set", "llm_model", model)
+        elif provider == "groq" and not self._store_get("llm_model"):
+            self._store("set", "llm_model", "llama-3.3-70b-versatile")
+        self._store("set", "llm_api_key", api_key)
         return self.get_llm_config()
 
     def _store_get(self, key: str, default=None):
