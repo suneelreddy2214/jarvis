@@ -1,0 +1,81 @@
+# QuantX — Institutional Trading Agent Configuration
+# Capital preservation is the primary objective.
+
+agent:
+  name: QuantX
+  version: "1.0.0"
+  mode: paper  # paper | live (live requires broker credentials)
+
+capital:
+  initial: 1000000  # INR
+  currency: INR
+
+risk:
+  max_risk_per_trade_pct: 1.0      # Never risk more than 1% per trade
+  max_daily_loss_pct: 2.0         # Halt after 2% daily loss
+  max_weekly_loss_pct: 5.0        # Halt after 5% weekly loss
+  max_open_positions: 5
+  min_risk_reward: 2.0            # Minimum 1:2 RR
+  max_consecutive_losses: 3       # Stop after 3 consecutive losses
+  max_drawdown_pct: 10.0          # Kill switch threshold
+  min_liquidity_avg_volume: 100000
+
+markets:
+  exchanges:
+    - NSE
+    - BSE
+  products:
+    - equity
+    - futures
+    - options
+    - etf
+  styles:
+    - intraday
+    - swing
+  trading_hours:
+    open: "09:15"
+    close: "15:30"
+    timezone: Asia/Kolkata
+  pre_market: "09:00"
+  post_market: "15:40"
+
+position_sizing:
+  method: atr  # atr | fixed_pct | volatility
+  atr_multiplier: 1.5
+  default_atr_period: 14
+
+indicators:
+  ema_periods: [9, 21, 50, 200]
+  sma_periods: [20, 50, 200]
+  rsi_period: 14
+  macd: {fast: 12, slow: 26, signal: 9}
+  adx_period: 14
+  atr_period: 14
+  bollinger: {period: 20, std: 2}
+  supertrend: {period: 10, multiplier: 3.0}
+
+entry:
+  require_trend: true
+  require_momentum: true
+  require_volume: true
+  min_confidence: 60
+  min_fundamental_score: 50
+  avoid_major_news: true
+
+exit:
+  use_atr_stop: true
+  use_trailing_stop: true
+  trailing_atr_mult: 2.0
+  time_exit_bars: 20
+
+broker:
+  name: paper
+  # Live credentials via environment variables only:
+  # QUANTX_BROKER_API_KEY, QUANTX_BROKER_API_SECRET, QUANTX_BROKER_ACCESS_TOKEN
+
+database:
+  path: data/quantx.db
+
+logging:
+  level: INFO
+  path: data/quantx.log
