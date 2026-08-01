@@ -213,19 +213,48 @@ class AdxTrendFilterStrategy(Strategy):
     trade_type = TradeType.SWING
     family = "momentum"
     phase = 1
-    description = "Trade only when ADX > 25 with trend direction"
+    description = "Trade only when ADX > 25 with trend + EMA alignment (no counter-trend)"
 
     def evaluate(self, snap: IndicatorSnapshot, df: pd.DataFrame) -> StrategySignal:
         if snap.adx < 25:
             return _sig(None, self.trade_type, 0, f"ADX {snap.adx:.1f} < 25 — skip sideways", ["adx_weak"])
+        # Require structural trend: price vs EMA50/200 + SuperTrend
         side = None
         tags = ["adx_gt_25"]
         boost = 5.0
-        if snap.trend == MarketDirection.BULLISH and snap.supertrend_dir == 1:
+        bull = (
+            snap.trend == MarketDirection.BULLISH
+            and snap.supertrend_dir == 1
+            and snap.close >= snap.ema_50
+            and snap.close >= snap.ema_200
+            and snap.momentum in ("up", "strong_up", "neutral")
+        )
+        bear = (
+            snap.trend == MarketDirection.BEARISH
+            and snap.supertrend_dir == -1
+            and snap.close <= snap.ema_50
+            and snap.close <= snap.ema_200
+            and snap.momentum in ("down", "strong_down", "neutral")
+        )
+        if bull:
             side = Side.BUY
-        elif snap.trend == MarketDirection.BEARISH and snap.supertrend_dir == -1:
+            tags += ["ema_aligned_long", "st_up"]
+            if snap.adx >= 30 and snap.momentum == "strong_up":
+                boost = 8.0
+        elif bear:
             side = Side.SELL
-        return _sig(side, self.trade_type, boost, f"ADX filter {side.value if side else 'FLAT'}", tags)
+            tags += ["ema_aligned_short", "st_down"]
+            if snap.adx >= 30 and snap.momentum == "strong_down":
+                boost = 8.0
+        else:
+            return _sig(
+                None,
+                self.trade_type,
+                0,
+                f"ADX {snap.adx:.1f} but trend/EMA/momentum not aligned — skip",
+                ["adx_no_align"],
+            )
+        return _sig(side, self.trade_type, boost, f"ADX filter {side.value}", tags)
 
 
 class VolumeBreakoutStrategy(Strategy):

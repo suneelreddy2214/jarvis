@@ -225,8 +225,8 @@ class PortfolioManager:
 
             # Trailing stop: only after favorable move of trail_after_r (default 1R).
             # Prior bug: immediately tightened stop to ~0.5R and caused noise stop-outs.
+            initial_risk = abs(p.entry_price - p.stop_loss)
             if self.settings.exit.use_trailing_stop:
-                initial_risk = abs(p.entry_price - p.stop_loss)
                 trail_after = float(getattr(self.settings.exit, "trail_after_r", 1.0) or 1.0)
                 trail_mult = float(getattr(self.settings.exit, "trailing_atr_mult", 2.0) or 2.0)
                 # Keep trail distance near initial risk (wider = less noise)
@@ -248,24 +248,48 @@ class PortfolioManager:
             else:
                 effective_stop = p.stop_loss
 
+            # Data-integrity: Yahoo vs stale/synthetic entry can gap 50%+ in one tick.
+            # Never realize a mark worse than the protective stop on such anomalies.
+            anomalous_gap = False
+            if p.entry_price > 0 and initial_risk > 0:
+                move_pct = abs(price - p.entry_price) / p.entry_price
+                move_r = abs(price - p.entry_price) / initial_risk
+                if move_pct >= 0.12 and move_r >= 3.0:
+                    adverse = (p.side == Side.BUY and price < p.entry_price) or (
+                        p.side == Side.SELL and price > p.entry_price
+                    )
+                    if adverse:
+                        anomalous_gap = True
+
             exit_reason = None
-            if p.side == Side.BUY:
+            fill_price = price
+            if anomalous_gap:
+                exit_reason = "Anomalous quote gap — protective stop fill (data integrity)"
+                fill_price = float(effective_stop)
+            elif p.side == Side.BUY:
                 if price <= effective_stop:
                     exit_reason = "Stop loss / trailing stop hit"
+                    # Hard stop fill: paper stop order fills at stop, not far below it
+                    fill_price = float(effective_stop)
                 elif price >= p.target_2:
                     exit_reason = "Target 2 hit"
+                    fill_price = float(p.target_2)
                 elif price >= p.target_1:
                     exit_reason = "Target 1 hit"
+                    fill_price = float(p.target_1)
             else:
                 if price >= effective_stop:
                     exit_reason = "Stop loss / trailing stop hit"
+                    fill_price = float(effective_stop)
                 elif price <= p.target_2:
                     exit_reason = "Target 2 hit"
+                    fill_price = float(p.target_2)
                 elif price <= p.target_1:
                     exit_reason = "Target 1 hit"
+                    fill_price = float(p.target_1)
 
             if exit_reason:
-                self.close_position(p.id, price, exit_reason)  # type: ignore[arg-type]
+                self.close_position(p.id, fill_price, exit_reason)  # type: ignore[arg-type]
             else:
                 self.db.update_position(p)
                 updated.append(p)

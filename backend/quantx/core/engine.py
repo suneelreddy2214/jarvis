@@ -212,6 +212,25 @@ class QuantXEngine:
         if risk_scale <= 0:
             rejects.append(f"Macro size multiplier zero: {macro.summary}")
 
+        # Index regime alignment — do not buy dips blindly in a down tape
+        nifty_bias = getattr(macro, "nifty_bias", "neutral")
+        if side == Side.BUY and nifty_bias == "bearish" and trade_type in (
+            TradeType.SWING,
+            TradeType.FUTURES,
+            TradeType.OPTIONS,
+        ):
+            rejects.append("Nifty bearish — no fresh longs (macro alignment)")
+        if side == Side.SELL and nifty_bias == "bullish" and trade_type in (
+            TradeType.SWING,
+            TradeType.FUTURES,
+        ):
+            rejects.append("Nifty bullish — no fresh shorts (macro alignment)")
+
+        # Weak/missing fundamentals: demand stronger technical confidence + half size
+        weak_fundamentals = (not index_sym) and fund.score <= 50
+        if weak_fundamentals:
+            risk_scale = min(risk_scale, 0.5)
+
         # --- Product-specific levels & sizing ---
         futures_note = ""
         options_note = opt.summary
@@ -341,8 +360,11 @@ class QuantXEngine:
         scores = self._score(snap, fund.score if not index_sym else max(fund.score, 60), order_side, levels["risk_reward"], macro)
         scores.confidence = round(min(100.0, scores.confidence + strategy_boost), 1)
         scores.probability_of_success = round(min(100.0, scores.confidence * 0.85), 1)
-        if scores.confidence < entry_cfg.min_confidence:
-            rejects.append(f"Confidence {scores.confidence:.0f} < {entry_cfg.min_confidence}")
+        min_conf = entry_cfg.min_confidence
+        if weak_fundamentals:
+            min_conf = max(min_conf, 70)  # demand stronger tech when fundamentals thin
+        if scores.confidence < min_conf:
+            rejects.append(f"Confidence {scores.confidence:.0f} < {min_conf}")
 
         reason = reason_prefix + self._build_reason(order_side, snap, fund, opt, macro)
         if strategy_reason:
