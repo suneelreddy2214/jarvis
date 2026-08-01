@@ -25,6 +25,8 @@ risk:
   soft_daily_loss_pct: 1.0        # Soft halt new entries earlier
   soft_weekly_loss_pct: 2.5
   soft_drawdown_pct: 5.0
+  pause_after_consecutive_losses: 1
+  loss_pause_minutes_per_streak: 30
 
 markets:
   exchanges:
@@ -102,6 +104,8 @@ paper:
   max_positions_per_symbol: 1
   max_new_entries_per_cycle: 1
   symbol_cooldown_hours: 24
+  chase_cooldown_minutes: 60
+  prioritize_unique_symbols: true
   # Cap how many products (SWING/FUT/OPT) can stack on one underlying
   fo_universe:
     - NIFTY

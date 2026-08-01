@@ -8,7 +8,7 @@ All trade proposals must pass these gates before execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -36,6 +36,7 @@ class RiskState:
     open_risk_amount: float = 0.0
     risk_day: Optional[str] = None  # YYYY-MM-DD IST
     risk_week: Optional[str] = None  # ISO week key
+    loss_pause_until: Optional[str] = None  # ISO timestamp — no new entries while active
 
 
 class RiskManager:
@@ -148,6 +149,13 @@ class RiskManager:
                 f"Soft drawdown throttle {self.drawdown_pct:.2f}% >= {soft_dd}% — no new entries"
             )
 
+        # Post-loss pause (anti-overtrading / revenge trading)
+        if self._loss_pause_active():
+            reasons.append(
+                f"Post-loss pause active until {self.state.loss_pause_until} "
+                f"(streak {self.state.consecutive_losses})"
+            )
+
         if reasons and not self.state.manual_override:
             self.state.trading_halted = True
             self.state.halt_reason = "; ".join(reasons)
@@ -240,6 +248,37 @@ class RiskManager:
 
         return (len(reasons) == 0, reasons)
 
+    def _loss_pause_active(self) -> bool:
+        until = self.state.loss_pause_until
+        if not until:
+            return False
+        try:
+            expiry = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=IST)
+            now = datetime.now(IST)
+            if expiry.tzinfo != IST:
+                expiry = expiry.astimezone(IST)
+            if now < expiry:
+                return True
+            # Expired — clear
+            self.state.loss_pause_until = None
+            return False
+        except Exception:
+            self.state.loss_pause_until = None
+            return False
+
+    def _arm_loss_pause(self) -> None:
+        """Pause new entries after consecutive losses to prevent overtrading."""
+        threshold = int(getattr(self.cfg, "pause_after_consecutive_losses", 1) or 1)
+        minutes_per = int(getattr(self.cfg, "loss_pause_minutes_per_streak", 30) or 30)
+        streak = int(self.state.consecutive_losses or 0)
+        if streak < threshold or minutes_per <= 0:
+            return
+        pause_min = minutes_per * streak
+        until = datetime.now(IST) + timedelta(minutes=pause_min)
+        self.state.loss_pause_until = until.isoformat()
+
     def register_trade_result(self, pnl: float) -> None:
         """Update consecutive loss streak and PnL after a closed trade."""
         self.ensure_period_rolls()
@@ -248,8 +287,10 @@ class RiskManager:
         self.state.capital += pnl
         if pnl < 0:
             self.state.consecutive_losses += 1
+            self._arm_loss_pause()
         else:
             self.state.consecutive_losses = 0
+            self.state.loss_pause_until = None
         if self.state.capital > self.state.peak_capital:
             self.state.peak_capital = self.state.capital
         self._recompute_halt()
@@ -274,6 +315,7 @@ class RiskManager:
         self.state.daily_realized_pnl = 0.0
         self.state.consecutive_losses = 0
         self.state.trades_today = 0
+        self.state.loss_pause_until = None
         self.state.risk_day = self._today_ist().isoformat()
         self._recompute_halt()
 

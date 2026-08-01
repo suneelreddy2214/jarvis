@@ -48,6 +48,7 @@ class PortfolioManager:
         trades_today = int(self.db.get_state("trades_today", 0) or 0)
         risk_day = self.db.get_state("risk_day", None)
         risk_week = self.db.get_state("risk_week", None)
+        loss_pause_until = self.db.get_state("loss_pause_until", None)
         opens = self.db.list_positions("OPEN")
         open_risk = sum(p.capital_at_risk for p in opens)
         unrealized = sum(float(p.pnl or 0) for p in opens)
@@ -66,6 +67,7 @@ class PortfolioManager:
             trades_today=trades_today,
             risk_day=risk_day,
             risk_week=risk_week,
+            loss_pause_until=loss_pause_until,
         )
         # Persist rolled day/week counters if calendar advanced
         self._persist_risk()
@@ -83,6 +85,7 @@ class PortfolioManager:
         self.db.set_state("trades_today", s.trades_today)
         self.db.set_state("risk_day", s.risk_day)
         self.db.set_state("risk_week", s.risk_week)
+        self.db.set_state("loss_pause_until", s.loss_pause_until)
 
     def margin_book(self) -> dict:
         """Stocks / F&O / ETF margin breakdown for dashboard."""
@@ -181,6 +184,29 @@ class PortfolioManager:
         except Exception:
             return False
         return datetime.utcnow() < expiry
+
+    def chase_on_cooldown(self, symbol: str) -> bool:
+        """True if we recently skipped this name for no-slot/duplicate — don't re-chase."""
+        raw = self.db.get_state("chase_cooldowns", {}) or {}
+        if not isinstance(raw, dict):
+            return False
+        until = raw.get(symbol.upper())
+        if not until:
+            return False
+        try:
+            expiry = datetime.fromisoformat(str(until).replace("Z", ""))
+        except Exception:
+            return False
+        return datetime.utcnow() < expiry
+
+    def set_chase_cooldown(self, symbol: str, minutes: float = 60.0) -> None:
+        from datetime import timedelta
+
+        raw = self.db.get_state("chase_cooldowns", {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        raw[symbol.upper()] = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat() + "Z"
+        self.db.set_state("chase_cooldowns", raw)
 
     def _set_symbol_cooldown(self, symbol: str, hours: float = 24.0) -> None:
         from datetime import timedelta

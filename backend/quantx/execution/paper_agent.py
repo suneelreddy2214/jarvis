@@ -225,10 +225,14 @@ class PaperTradingAgent:
             open_risk_amount=0.0,
             trading_halted=False,
             halt_reason=None,
+            loss_pause_until=None,
+            trades_today=0,
         )
         self.portfolio._persist_risk()
         self.portfolio.db.set_state("total_fees", 0.0)
         self.portfolio.db.set_state("capital_basis", initial)
+        self.portfolio.db.set_state("symbol_cooldowns", {})
+        self.portfolio.db.set_state("chase_cooldowns", {})
         self.portfolio.db.set_state("paper_reset_at", datetime.utcnow().isoformat() + "Z")
         self.stats = SessionStats()
         return {"ok": True, "message": f"Paper account reset to ₹{initial:,.0f}", **self.status()}
@@ -362,7 +366,6 @@ class PaperTradingAgent:
         def _exec_rank(r: TradeRecommendation) -> tuple:
             fo = r.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
             idx = is_index(r.symbol)
-            # lower tuple sorts first: valid already filtered later
             return (
                 0 if (fo and idx) else (1 if not fo else 2),
                 -r.scores.confidence,
@@ -389,7 +392,7 @@ class PaperTradingAgent:
             )
             self.stats.skipped += 1
 
-        # 3) Auto-execute top valid (keyed by symbol+trade_type)
+        # 3) Prioritized execution queue — do not chase duplicates / no-slot names
         if self.stats.auto_execute:
             max_pos = self.settings.risk.max_open_positions
             paper_cfg = getattr(self.settings, "paper", None) or {}
@@ -398,6 +401,15 @@ class PaperTradingAgent:
             max_fo = int(paper_cfg.get("max_fo_positions", 2))
             max_per_sym = int(paper_cfg.get("max_positions_per_symbol", 1))
             max_new = int(paper_cfg.get("max_new_entries_per_cycle", 1))
+            chase_mins = float(paper_cfg.get("chase_cooldown_minutes", 60) or 60)
+            unique_syms = bool(paper_cfg.get("prioritize_unique_symbols", True))
+            # After losses, shrink per-cycle entries further (pause handled by risk.status)
+            streak = int(self.portfolio.risk.state.consecutive_losses or 0)
+            if streak >= 1:
+                max_new = min(max_new, 1)
+            if streak >= 2:
+                max_new = 0  # size/pause path — risk gate should already block; belt & suspenders
+
             opens_now = self.portfolio.db.list_positions("OPEN")
             open_keys = {(p.symbol, p.trade_type.value) for p in opens_now}
             open_syms: dict[str, int] = {}
@@ -408,42 +420,63 @@ class PaperTradingAgent:
                 for p in opens_now
                 if p.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
             )
-            slots = max_pos - len(opens_now)
-            fo_skips_logged = False
-            slot_skips_logged = False
-            entries_this_cycle = 0
+            slots = max(0, max_pos - len(opens_now))
+            fo_slots = max(0, max_fo - fo_open)
+
+            # Build actionable queue (filter before looping — avoids spam rejects)
+            queue: list[TradeRecommendation] = []
+            seen_underlying: set[str] = set()
             for rec in valid:
                 key = (rec.symbol, rec.trade_type.value)
                 is_fo = rec.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
-                if entries_this_cycle >= max_new:
-                    _skip(rec, f"Max new entries/cycle ({max_new}) — curb overtrading")
-                    continue
-                if slots <= 0:
-                    if not slot_skips_logged:
-                        _skip(rec, f"Max open positions ({max_pos}) — remaining signals skipped")
-                        slot_skips_logged = True
-                    continue
-                if is_fo and fo_open >= max_fo:
-                    if not fo_skips_logged:
-                        _skip(rec, f"Max F&O positions ({max_fo}/{max_fo}) — remaining F&O skipped")
-                        fo_skips_logged = True
-                    continue
                 if key in open_keys:
-                    _skip(rec, "Already in position — no averaging")
-                    continue
+                    continue  # already in book — don't chase
                 if open_syms.get(rec.symbol, 0) >= max_per_sym:
-                    _skip(
-                        rec,
-                        f"Max positions per symbol ({max_per_sym}) — diversify away from {rec.symbol}",
-                    )
                     continue
                 if self.portfolio.symbol_on_cooldown(rec.symbol):
-                    _skip(rec, f"{rec.symbol} on post-stop cooldown — no revenge trade")
                     continue
-                # Re-check risk each attempt (daily loss / consecutive / trade budget)
+                if self.portfolio.chase_on_cooldown(rec.symbol):
+                    continue
+                if is_fo and fo_slots <= 0:
+                    continue
+                if unique_syms and rec.symbol in seen_underlying:
+                    continue  # one product per underlying in this cycle's queue
+                if unique_syms and rec.symbol in open_syms:
+                    continue
+                queue.append(rec)
+                seen_underlying.add(rec.symbol)
+
+            # Cap queue to what we can actually fill this cycle
+            take_n = min(len(queue), slots, max_new) if max_new > 0 and slots > 0 else 0
+            to_execute = queue[:take_n]
+            not_chased = queue[take_n:]
+
+            # Single summary skip instead of N duplicate/no-slot rejects
+            if not_chased:
+                names = ", ".join(f"{r.symbol}/{r.trade_type.value}" for r in not_chased[:8])
+                more = f" +{len(not_chased) - 8} more" if len(not_chased) > 8 else ""
+                skipped.append(
+                    {
+                        "symbol": "*",
+                        "trade_type": "ALL",
+                        "reason": (
+                            f"Prioritized queue — not chasing {len(not_chased)} lower-ranked "
+                            f"signal(s) (slots={slots}, max_new={max_new}): {names}{more}"
+                        ),
+                        "status": "SKIPPED",
+                    }
+                )
+                self.stats.skipped += 1
+                # Chase cooldown so next cycles don't keep hammering same names
+                for r in not_chased:
+                    self.portfolio.set_chase_cooldown(r.symbol, minutes=chase_mins)
+
+            for rec in to_execute:
+                key = (rec.symbol, rec.trade_type.value)
+                is_fo = rec.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
                 risk_now = self.portfolio.risk.status()
                 if not risk_now.can_trade:
-                    _skip(rec, f"Risk halt mid-cycle — {'; '.join(risk_now.reasons)}")
+                    _skip(rec, f"Risk/pause halt — {'; '.join(risk_now.reasons)}")
                     break
                 fill = self.broker.retry_safe(rec)
                 if fill.get("status") == "FILLED":
@@ -461,9 +494,9 @@ class PaperTradingAgent:
                     open_keys.add(key)
                     open_syms[rec.symbol] = open_syms.get(rec.symbol, 0) + 1
                     slots -= 1
-                    entries_this_cycle += 1
                     if is_fo:
                         fo_open += 1
+                        fo_slots = max(0, max_fo - fo_open)
                     self.stats.executed += 1
                 else:
                     rejected.append(
@@ -475,6 +508,8 @@ class PaperTradingAgent:
                         }
                     )
                     self.stats.rejected += 1
+                    # Don't immediately re-chase a hard reject
+                    self.portfolio.set_chase_cooldown(rec.symbol, minutes=chase_mins)
 
         msg = (
             f"Cycle #{self.stats.cycles}: regime={regime.regime.value}, "

@@ -31,6 +31,9 @@ class RiskConfig(BaseModel):
     soft_daily_loss_pct: float = 1.0
     soft_weekly_loss_pct: float = 2.5
     soft_drawdown_pct: float = 5.0
+    # Pause new entries after losses (anti-overtrading / revenge trading)
+    pause_after_consecutive_losses: int = 1
+    loss_pause_minutes_per_streak: int = 30
 
 
 class CapitalConfig(BaseModel):
@@ -115,6 +118,8 @@ class Settings(BaseModel):
             "max_positions_per_symbol": 1,
             "max_new_entries_per_cycle": 1,
             "symbol_cooldown_hours": 24,
+            "chase_cooldown_minutes": 60,
+            "prioritize_unique_symbols": True,
         }
     )
     logging: dict[str, Any] = Field(default_factory=dict)
