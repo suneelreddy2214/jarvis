@@ -213,8 +213,38 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ symbol, exchange: 'NSE', trade_type }),
     }),
-  scan: (symbols: string[], opts: { trade_type?: string; enable_fno?: boolean } = {}) =>
-    req<{ count: number; valid_count: number; recommendations: TradeRecommendation[]; enable_fno?: boolean }>(
+  scan: (symbols: string[], opts: {
+    trade_type?: string
+    enable_fno?: boolean
+    hunt_market?: boolean
+    top_n?: number
+    style_ids?: string[]
+    min_hunt_score?: number
+  } = {}) =>
+    req<{
+      count: number
+      valid_count: number
+      recommendations: TradeRecommendation[]
+      enable_fno?: boolean
+      mode?: string
+      hunted?: Array<{
+        symbol: string
+        score: number
+        change_pct: number
+        volume_ratio: number
+        adx: number
+        rsi: number
+        atr_pct: number
+        reasons: string[]
+        is_index: boolean
+      }>
+      hunted_symbols?: string[]
+      universe_size?: number
+      strategies_used?: Record<string, string[]>
+      styles_touched?: Array<{ id: string; name: string; ai_suitability?: number }>
+      regime?: { regime?: string; summary?: string; preferred_families?: string[] }
+      message?: string
+    }>(
       '/api/scan',
       {
         method: 'POST',
@@ -223,9 +253,49 @@ export const api = {
           exchange: 'NSE',
           trade_type: opts.trade_type || 'SWING',
           enable_fno: opts.enable_fno ?? false,
+          hunt_market: opts.hunt_market ?? false,
+          top_n: opts.top_n ?? 8,
+          style_ids: opts.style_ids,
+          min_hunt_score: opts.min_hunt_score ?? 52,
         }),
       },
     ),
+  hunt: (opts: {
+    seed_symbols?: string[]
+    top_n?: number
+    enable_fno?: boolean
+    trade_type?: string
+    style_ids?: string[]
+  } = {}) =>
+    req<{
+      ok: boolean
+      mode: string
+      hunted: Array<{
+        symbol: string
+        score: number
+        change_pct: number
+        volume_ratio: number
+        reasons: string[]
+      }>
+      hunted_symbols: string[]
+      universe_size: number
+      strategies_used: Record<string, string[]>
+      styles_touched: Array<{ id: string; name: string }>
+      regime: { regime?: string; summary?: string }
+      count: number
+      valid_count: number
+      recommendations: TradeRecommendation[]
+      message: string
+    }>('/api/hunt', {
+      method: 'POST',
+      body: JSON.stringify({
+        seed_symbols: opts.seed_symbols,
+        top_n: opts.top_n ?? 8,
+        enable_fno: opts.enable_fno ?? true,
+        trade_type: opts.trade_type || 'ALL',
+        style_ids: opts.style_ids,
+      }),
+    }),
   execute: (symbol: string, trade_type = 'SWING') =>
     req<{ status: string; message: string; recommendation: TradeRecommendation }>(
       '/api/execute',

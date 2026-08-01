@@ -19,6 +19,7 @@ import quantx.analysis.additional_strategies  # noqa: F401 — register additive
 import quantx.analysis.trading_styles  # noqa: F401 — register style strategies
 from quantx.analysis.learning import StrategyLearner
 from quantx.analysis.trading_styles import get_trading_styles, train_trading_styles
+from quantx.analysis.opportunity_hunter import OpportunityHunter, HUNT_UNIVERSE
 from quantx.analysis.regime import RegimeDetector
 from quantx.core.chat import QuantXChat
 from quantx.core.config import get_settings
@@ -152,6 +153,21 @@ class ScanRequest(BaseModel):
     strategy: Optional[str] = None
     enable_fno: bool = False
     fo_symbols: Optional[list[str]] = None
+    hunt_market: bool = False
+    top_n: int = 8
+    style_ids: Optional[list[str]] = None
+    min_hunt_score: float = 52.0
+
+
+class HuntRequest(BaseModel):
+    seed_symbols: Optional[list[str]] = None
+    top_n: int = 8
+    exchange: str = "NSE"
+    enable_fno: bool = True
+    trade_type: str = "ALL"
+    style_ids: Optional[list[str]] = None
+    min_score: float = 52.0
+    strategies_per_product: int = 2
 
 
 class ExecuteRequest(BaseModel):
@@ -398,6 +414,21 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/api/scan")
 def scan(req: ScanRequest):
+    # AI market hunt: discover opportunistic symbols then process via strategies/styles
+    if req.hunt_market:
+        hunter = OpportunityHunter(engine=engine, market_data=market_data, db=db)
+        tt = req.trade_type.value if isinstance(req.trade_type, TradeType) else str(req.trade_type)
+        result = hunter.hunt_and_process(
+            seed_symbols=req.symbols,
+            top_n=req.top_n,
+            exchange=req.exchange,
+            enable_fno=req.enable_fno or tt == "ALL",
+            trade_type="ALL" if req.enable_fno else tt,
+            style_ids=req.style_ids,
+            min_score=req.min_hunt_score,
+        )
+        return result
+
     results = []
     if req.enable_fno:
         # Stocks + Futures + Options in one pass
@@ -419,7 +450,38 @@ def scan(req: ScanRequest):
         "count": len(results),
         "valid_count": sum(1 for r in results if r.valid),
         "enable_fno": req.enable_fno,
+        "mode": "watchlist",
+        "hunted_symbols": req.symbols,
         "recommendations": [r.model_dump(mode="json") for r in results],
+    }
+
+
+@app.post("/api/hunt")
+def hunt_market(req: HuntRequest):
+    """Go to market, hunt opportunistic symbols, process with strategies/trading styles."""
+    hunter = OpportunityHunter(engine=engine, market_data=market_data, db=db)
+    try:
+        return hunter.hunt_and_process(
+            seed_symbols=req.seed_symbols,
+            top_n=req.top_n,
+            exchange=req.exchange,
+            enable_fno=req.enable_fno,
+            trade_type=req.trade_type,
+            style_ids=req.style_ids,
+            min_score=req.min_score,
+            strategies_per_product=req.strategies_per_product,
+        )
+    except Exception as e:
+        logger.exception("Market hunt failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/hunt/universe")
+def hunt_universe():
+    return {
+        "count": len(HUNT_UNIVERSE),
+        "symbols": HUNT_UNIVERSE,
+        "note": "AI hunt screens this universe for momentum, volume, breakout, oversold/overbought opportunities.",
     }
 
 

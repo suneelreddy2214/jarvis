@@ -84,6 +84,18 @@ export default function App() {
   const [strategy, setStrategy] = useState('swing_trend')
   const [enableFno, setEnableFno] = useState(true)
   const [scanProduct, setScanProduct] = useState<'ALL' | 'SWING' | 'FUTURES' | 'OPTIONS'>('ALL')
+  const [huntMarket, setHuntMarket] = useState(true)
+  const [hunted, setHunted] = useState<
+    Array<{
+      symbol: string
+      score: number
+      change_pct: number
+      volume_ratio: number
+      reasons: string[]
+      is_index?: boolean
+    }>
+  >([])
+  const [huntMeta, setHuntMeta] = useState('')
   const [capitalDelta, setCapitalDelta] = useState('100000')
   const [regimeInfo, setRegimeInfo] = useState<{
     regime: string
@@ -613,25 +625,46 @@ export default function App() {
     const useFno = scanProduct === 'ALL'
     const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
     setStatus(
-      useFno
-        ? 'Scanning Stocks + F&O…'
-        : scanProduct === 'SWING'
-          ? 'Scanning Stocks only…'
-          : `Scanning ${scanProduct} only…`,
+      huntMarket
+        ? `AI hunting market opportunities across universe, then processing via strategies…`
+        : useFno
+          ? 'Scanning Stocks + F&O…'
+          : scanProduct === 'SWING'
+            ? 'Scanning Stocks only…'
+            : `Scanning ${scanProduct} only…`,
     )
     try {
       const res = await api.scan(list, {
         enable_fno: useFno,
         trade_type: product,
+        hunt_market: huntMarket,
+        top_n: 8,
       })
       const rows = res.recommendations || []
       setRecs(rows)
       const firstValid = rows.find((x) => x.valid) || rows[0] || null
       setSelected(firstValid)
+      if (res.hunted && res.hunted.length) {
+        setHunted(res.hunted)
+        setSymbols((res.hunted_symbols || res.hunted.map((h) => h.symbol)).join(', '))
+        const stratCount = Object.values(res.strategies_used || {}).reduce((n, arr) => n + (arr?.length || 0), 0)
+        setHuntMeta(
+          `${res.message || ''} · regime ${res.regime?.regime || '—'} · ${stratCount} strategies` +
+            (res.styles_touched?.length
+              ? ` · styles ${res.styles_touched
+                  .slice(0, 4)
+                  .map((s) => s.name)
+                  .join(', ')}`
+              : ''),
+        )
+      } else {
+        setHunted([])
+        setHuntMeta('')
+      }
       setStatus(
         rows.length === 0
           ? 'Scan returned no recommendations'
-          : `Scan complete — ${res.valid_count}/${res.count} actionable · ${
+          : `${res.mode === 'market_hunt' ? 'Hunt' : 'Scan'} complete — ${res.valid_count}/${res.count} actionable · ${
               firstValid
                 ? `selected ${firstValid.symbol} ${firstValid.trade_type}${firstValid.valid ? '' : ' (rejected setup)'}`
                 : 'none selected'
@@ -641,6 +674,7 @@ export default function App() {
     } catch (err) {
       setRecs([])
       setSelected(null)
+      setHunted([])
       setStatus(`Scan failed: ${(err as Error).message}`)
     } finally {
       setBusy(false)
@@ -1870,7 +1904,7 @@ export default function App() {
               <h2>Signal Scanner</h2>
               <div className="actions">
                 <button className="btn primary" disabled={busy} onClick={runScan}>
-                  Scan
+                  {huntMarket ? 'Hunt Market' : 'Scan'}
                 </button>
                 <button className="btn" disabled={busy || !selected} onClick={executeSelected}>
                   Execute Paper
@@ -1881,10 +1915,19 @@ export default function App() {
               <input
                 value={symbols}
                 onChange={(e) => setSymbols(e.target.value)}
-                placeholder="NSE symbols, comma-separated"
+                placeholder={huntMarket ? 'Optional seeds (AI hunts market, then fills winners here)' : 'NSE symbols, comma-separated'}
               />
             </div>
             <div className="scan-row" style={{ marginTop: '0.5rem', gap: '0.75rem', alignItems: 'center' }}>
+              <label className="chip" style={{ cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={huntMarket}
+                  onChange={(e) => setHuntMarket(e.target.checked)}
+                  style={{ marginRight: '0.4rem' }}
+                />
+                AI market hunt (discover symbols → strategies / styles)
+              </label>
               <label className="chip" style={{ cursor: 'pointer' }}>
                 <input
                   type="checkbox"
@@ -1913,10 +1956,44 @@ export default function App() {
                 <option value="OPTIONS">Options only</option>
               </select>
             </div>
+            {huntMeta && <p className="prose" style={{ marginTop: '0.5rem' }}>{huntMeta}</p>}
+            {hunted.length > 0 && (
+              <div style={{ overflowX: 'auto', marginTop: '0.75rem', marginBottom: '0.75rem' }}>
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Hunted</th>
+                      <th>Score</th>
+                      <th>Chg%</th>
+                      <th>Vol</th>
+                      <th>Why</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {hunted.map((h) => (
+                      <tr key={h.symbol} onClick={() => void analyzeOne(h.symbol)} style={{ cursor: 'pointer' }}>
+                        <td>
+                          {h.symbol}
+                          {h.is_index ? <span className="pill valid" style={{ marginLeft: 6 }}>IDX</span> : null}
+                        </td>
+                        <td>{h.score.toFixed(0)}</td>
+                        <td className={h.change_pct >= 0 ? 'pos' : 'neg'}>{pct(h.change_pct)}</td>
+                        <td>{h.volume_ratio.toFixed(1)}x</td>
+                        <td style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>{(h.reasons || []).join(' · ')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
             {busy && recs.length === 0 ? (
-              <p className="empty">Scanning…</p>
+              <p className="empty">{huntMarket ? 'Hunting market & processing strategies…' : 'Scanning…'}</p>
             ) : recs.length === 0 ? (
-              <p className="empty">Run a scan to generate Stocks and F&amp;O recommendations with confidence &amp; risk scores.</p>
+              <p className="empty">
+                {huntMarket
+                  ? 'Click Hunt Market — AI screens the NSE universe, brings opportunity symbols here, then runs strategies / trading models.'
+                  : 'Run a scan to generate Stocks and F&O recommendations with confidence & risk scores.'}
+              </p>
             ) : (
               <table className="table">
                 <thead>
