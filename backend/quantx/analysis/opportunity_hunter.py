@@ -18,7 +18,7 @@ from quantx.analysis.regime import RegimeDetector
 from quantx.analysis.selector import select_strategies_for_regime
 from quantx.analysis.strategies import STRATEGIES
 from quantx.analysis.technical import TechnicalAnalyzer
-from quantx.analysis.trading_styles import TRADING_STYLES, get_style, resolve_style_ids, style_strategy_jobs
+from quantx.analysis.trading_styles import TRADING_STYLES, resolve_style_ids, style_strategy_jobs
 from quantx.core.engine import QuantXEngine
 from quantx.core.models import TradeRecommendation, TradeType
 from quantx.data.market_data import MarketDataService
