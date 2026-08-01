@@ -126,6 +126,11 @@ export type MarginBook = {
     exposure: number
     unrealized_pnl: number
     capital_at_risk: number
+    option_type?: string | null
+    strike?: number | null
+    expiry?: string | null
+    expiry_label?: string | null
+    underlying_entry?: number | null
   }>
   notes: string[]
 }

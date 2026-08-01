@@ -69,22 +69,28 @@ def option_kind_for_side(underlying_side: Side) -> str:
     return "CE" if underlying_side == Side.BUY else "PE"
 
 
-def encode_fo_meta(underlying: float, kind: str, strike: float) -> str:
-    return f"[FO u={underlying:.2f} {kind} k={strike:.2f}]"
+def encode_fo_meta(underlying: float, kind: str, strike: float, expiry: Optional[str] = None) -> str:
+    base = f"[FO u={underlying:.2f} {kind} k={strike:.2f}"
+    if expiry:
+        return f"{base} e={expiry}]"
+    return f"{base}]"
 
 
 def parse_fo_meta(reason: str) -> Optional[dict]:
     m = re.search(
-        r"\[FO u=(?P<u>[0-9.]+) (?P<kind>CE|PE) k=(?P<k>[0-9.]+)\]",
+        r"\[FO u=(?P<u>[0-9.]+) (?P<kind>CE|PE|FUT) k=(?P<k>[0-9.]+)(?: e=(?P<e>\d{4}-\d{2}-\d{2}))?\]",
         reason or "",
     )
     if not m:
         return None
-    return {
+    out = {
         "underlying_entry": float(m.group("u")),
         "kind": m.group("kind"),
         "strike": float(m.group("k")),
     }
+    if m.group("e"):
+        out["expiry"] = m.group("e")
+    return out
 
 
 def mark_option_premium(

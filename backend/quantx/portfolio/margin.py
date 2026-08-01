@@ -41,6 +41,11 @@ class PositionMargin:
     exposure: float
     unrealized_pnl: float
     capital_at_risk: float
+    option_type: Optional[str] = None  # CE | PE | FUT
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    expiry_label: Optional[str] = None
+    underlying_entry: Optional[float] = None
 
 
 @dataclass
@@ -115,6 +120,11 @@ class MarginBook:
                     "exposure": round(p.exposure, 2),
                     "unrealized_pnl": round(p.unrealized_pnl, 2),
                     "capital_at_risk": round(p.capital_at_risk, 2),
+                    "option_type": p.option_type,
+                    "strike": p.strike,
+                    "expiry": p.expiry,
+                    "expiry_label": p.expiry_label,
+                    "underlying_entry": p.underlying_entry,
                 }
                 for p in self.positions
             ],
@@ -170,6 +180,44 @@ class MarginCalculator:
 
         margin = notional * frac
         exposure = float(p.current_price) * int(p.quantity) * mult
+
+        option_type = None
+        strike = None
+        expiry = None
+        expiry_label = None
+        underlying_entry = None
+        if segment == "FO":
+            from quantx.analysis.fno import parse_fo_meta
+
+            meta = parse_fo_meta(getattr(p, "reason", "") or "")
+            if meta:
+                option_type = meta.get("kind")
+                strike = meta.get("strike")
+                expiry = meta.get("expiry")
+                underlying_entry = meta.get("underlying_entry")
+            if not option_type:
+                option_type = "FUT" if product == "Futures" else None
+            if not expiry:
+                from quantx.analysis.option_chain import list_expiries
+
+                exps = list_expiries(p.symbol, count=2)
+                if exps:
+                    # Futures prefer monthly; options nearest
+                    pick = (
+                        next((e for e in exps if e.get("kind") == "monthly"), exps[0])
+                        if product == "Futures"
+                        else exps[0]
+                    )
+                    expiry = pick["expiry"]
+                    expiry_label = pick["label"]
+            elif expiry:
+                try:
+                    from datetime import date
+
+                    expiry_label = date.fromisoformat(expiry).strftime("%d-%b-%Y")
+                except Exception:
+                    expiry_label = expiry
+
         return PositionMargin(
             position_id=p.id,
             symbol=p.symbol,
@@ -187,6 +235,11 @@ class MarginCalculator:
             exposure=exposure,
             unrealized_pnl=float(p.pnl or 0),
             capital_at_risk=float(p.capital_at_risk or 0),
+            option_type=option_type,
+            strike=strike,
+            expiry=expiry,
+            expiry_label=expiry_label,
+            underlying_entry=underlying_entry,
         )
 
     def build_book(self, capital: float, positions: list[Position]) -> MarginBook:

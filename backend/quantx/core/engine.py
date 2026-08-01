@@ -18,6 +18,7 @@ from quantx.analysis.fno import (
     paper_option_levels,
     paper_option_premium,
 )
+from quantx.analysis.option_chain import list_expiries
 from quantx.analysis.macro import MacroAnalyzer
 from quantx.analysis.options import OptionsAnalyzer
 from quantx.analysis.strategies import Strategy, get_strategy
@@ -207,8 +208,19 @@ class QuantXEngine:
                 broker_margin_pct=MARGIN_FRAC["FUTURES"] * 100,
                 quantity_as_lots=True,
             )
+            # Tag nearest monthly (or weekly for index) expiry on futures
+            exps = list_expiries(symbol_clean, count=6)
+            monthly = next((e for e in exps if e.get("kind") == "monthly"), exps[0] if exps else None)
+            if monthly:
+                fo_meta = encode_fo_meta(snap.close, "FUT", float(round(snap.close)), monthly["expiry"])
             strategy_tags = strategy_tags + ["futures", f"lot={mult}"]
-            reason_prefix = f"FUTURES ({mult} mult). {futures_note}. "
+            if monthly:
+                strategy_tags.append(f"expiry={monthly['expiry']}")
+            reason_prefix = (
+                f"FUTURES ({mult} mult"
+                + (f", expiry {monthly['label']}" if monthly else "")
+                + f"). {futures_note}. {fo_meta} "
+            )
 
         elif trade_type == TradeType.OPTIONS:
             # Directional long premium only (CE on bullish, PE on bearish)
@@ -218,10 +230,14 @@ class QuantXEngine:
             strike = round(snap.close / 50) * 50
             if symbol_clean.upper() == "BANKNIFTY":
                 strike = round(snap.close / 100) * 100
-            fo_meta = encode_fo_meta(snap.close, kind, float(strike))
+            exps = list_expiries(symbol_clean, count=6)
+            near = exps[0] if exps else None
+            expiry_iso = near["expiry"] if near else None
+            fo_meta = encode_fo_meta(snap.close, kind, float(strike), expiry_iso)
             options_note = (
-                f"Paper {kind} @ strike {strike:.0f}, premium ₹{premium:.2f} (ATM proxy). "
-                f"{opt.summary}"
+                f"Paper {kind} @ strike {strike:.0f}"
+                + (f", expiry {near['label']}" if near else "")
+                + f", premium ₹{premium:.2f} (ATM proxy). {opt.summary}"
             )
             order_side = Side.BUY  # always long options in v1
             mult = lot_multiplier(TradeType.OPTIONS, symbol_clean)
@@ -245,6 +261,8 @@ class QuantXEngine:
                 quantity_as_lots=True,
             )
             strategy_tags = strategy_tags + ["options", kind, f"lot={mult}"]
+            if expiry_iso:
+                strategy_tags.append(f"expiry={expiry_iso}")
             reason_prefix = f"OPTIONS long {kind}. {fo_meta} "
 
         else:

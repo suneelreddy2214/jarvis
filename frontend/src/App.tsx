@@ -510,10 +510,10 @@ export default function App() {
   }, [searchSymbol])
 
   useEffect(() => {
-    if (tab !== 'search') return
-    void runSymbolSearch(searchSymbol || 'NIFTY')
+    if (tab !== 'search' && tab !== 'margin') return
     void loadFnoSymbol(searchSymbol || 'NIFTY', selectedExpiry || undefined)
-    // intentionally only when opening the Search tab
+    if (tab === 'search') void runSymbolSearch(searchSymbol || 'NIFTY')
+    // intentionally only when opening Search / F&O tabs
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab])
 
@@ -738,8 +738,8 @@ export default function App() {
           Search / F&amp;O
         </button>
         <button className={`tab${tab === 'margin' ? ' active' : ''}`} onClick={() => setTab('margin')} type="button">
-          Stocks / F&amp;O
-          <span className="count">{(marginBook?.stocks_count || 0) + (marginBook?.fno_count || 0)}</span>
+          F&amp;O
+          <span className="count">{marginBook?.fno_count || 0}</span>
         </button>
         <button className={`tab${tab === 'orders' ? ' active' : ''}`} onClick={() => setTab('orders')} type="button">
           Orders<span className="count">{orders.length}</span>
@@ -1031,10 +1031,10 @@ export default function App() {
       )}
 
       {tab === 'margin' && (
-        <div className="margin-page">
+        <div className="margin-page search-fno-page">
           <section className="panel" style={{ marginBottom: '1rem' }}>
             <div className="panel-head">
-              <h2>Margin Amount</h2>
+              <h2>F&amp;O Desk</h2>
               <div className="actions">
                 <button className="btn" type="button" onClick={() => void refresh()}>
                   Refresh
@@ -1042,31 +1042,13 @@ export default function App() {
               </div>
             </div>
             {!marginBook ? (
-              <p className="empty">Loading margin book…</p>
+              <p className="empty">Loading F&amp;O margin…</p>
             ) : (
               <>
                 <div className="rec-grid" style={{ marginBottom: '1rem' }}>
                   <div className="rec-cell">
                     <span>Capital</span>
                     <strong>{inr(marginBook.capital)}</strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>Used Margin</span>
-                    <strong>{inr(marginBook.total_margin_used)}</strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>Available Margin</span>
-                    <strong className="pos">{inr(marginBook.available_margin)}</strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>Utilization</span>
-                    <strong className={marginBook.margin_utilization_pct > 80 ? 'neg' : ''}>
-                      {marginBook.margin_utilization_pct.toFixed(1)}%
-                    </strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>Stocks Margin</span>
-                    <strong>{inr(marginBook.by_segment.stocks.margin_used + marginBook.by_segment.etf.margin_used)}</strong>
                   </div>
                   <div className="rec-cell">
                     <span>F&amp;O Margin</span>
@@ -1077,127 +1059,91 @@ export default function App() {
                     <strong>{inr(marginBook.fo_total_exposure)}</strong>
                   </div>
                   <div className="rec-cell">
+                    <span>Futures Margin</span>
+                    <strong>{inr(marginBook.by_segment.futures.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Options Margin</span>
+                    <strong>{inr(marginBook.by_segment.options.margin_used)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Available</span>
+                    <strong className="pos">{inr(marginBook.available_margin)}</strong>
+                  </div>
+                  <div className="rec-cell">
+                    <span>Open F&amp;O</span>
+                    <strong>{marginBook.fno_count}</strong>
+                  </div>
+                  <div className="rec-cell">
                     <span>Unrealized</span>
                     <strong className={marginBook.unrealized_pnl >= 0 ? 'pos' : 'neg'}>
                       {inr(marginBook.unrealized_pnl)}
                     </strong>
                   </div>
                 </div>
-                <div className="util-track" aria-label="Margin utilization">
-                  <div
-                    className="util-fill"
-                    style={{ width: `${Math.max(0, Math.min(100, marginBook.margin_utilization_pct))}%` }}
-                  />
-                </div>
-                <p className="empty" style={{ marginTop: '0.75rem' }}>
-                  {marginBook.notes.join(' ')}
+                <p className="empty">
+                  Paper F&amp;O margins are SPAN-style estimates. Open futures/options show expiry and CE/PE below; pick a
+                  symbol to inspect the full chain.
                 </p>
               </>
             )}
           </section>
 
-          <div className="grid">
-            <section className="panel">
-              <div className="panel-head">
-                <h2>Stocks</h2>
-                <span className="pill valid">{marginBook?.stocks_count ?? 0} open</span>
-              </div>
-              {!marginBook || marginBook.stocks.length === 0 ? (
-                <p className="empty">
-                  No open stock / ETF positions. Paper scanner opens SWING equity (CNC 100% cash) or INTRADAY (MIS ~20%).
-                </p>
-              ) : (
+          <section className="panel" style={{ marginBottom: '1rem' }}>
+            <div className="panel-head">
+              <h2>Open F&amp;O Positions</h2>
+              <span className="pill buy">{marginBook?.fno_count ?? 0} open</span>
+            </div>
+            {!marginBook || marginBook.fno.length === 0 ? (
+              <p className="empty">
+                No open Futures / Options yet. Start paper with F&amp;O enabled, or use Overview → Scan (Futures / Options).
+                Expiry dates and Call/Put chain are available in the section below.
+              </p>
+            ) : (
+              <div style={{ overflowX: 'auto' }}>
                 <table className="table">
                   <thead>
                     <tr>
                       <th>Symbol</th>
                       <th>Type</th>
-                      <th>Side</th>
-                      <th>Qty</th>
-                      <th>LTP</th>
-                      <th>Exposure</th>
-                      <th>Margin</th>
-                      <th>PnL</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {marginBook.stocks.map((p) => (
-                      <tr key={`eq-${p.position_id}-${p.symbol}`}>
-                        <td>{p.symbol}</td>
-                        <td>
-                          {p.product} · {p.trade_type}
-                        </td>
-                        <td>
-                          <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
-                        </td>
-                        <td>{p.quantity}</td>
-                        <td>{inrDec(p.ltp)}</td>
-                        <td>{inr(p.exposure)}</td>
-                        <td>
-                          {inr(p.margin_required)}
-                          <span className="muted"> ({p.margin_pct}%)</span>
-                        </td>
-                        <td className={p.unrealized_pnl >= 0 ? 'pos' : 'neg'}>{inr(p.unrealized_pnl)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-              {marginBook && (
-                <div className="rec-grid" style={{ marginTop: '1rem' }}>
-                  <div className="rec-cell">
-                    <span>Stocks margin used</span>
-                    <strong>{inr(marginBook.by_segment.stocks.margin_used)}</strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>Stocks exposure</span>
-                    <strong>{inr(marginBook.by_segment.stocks.exposure)}</strong>
-                  </div>
-                  <div className="rec-cell">
-                    <span>ETF margin</span>
-                    <strong>{inr(marginBook.by_segment.etf.margin_used)}</strong>
-                  </div>
-                </div>
-              )}
-            </section>
-
-            <section className="panel">
-              <div className="panel-head">
-                <h2>F&amp;O</h2>
-                <span className="pill buy">{marginBook?.fno_count ?? 0} open</span>
-              </div>
-              {!marginBook || marginBook.fno.length === 0 ? (
-                <p className="empty">
-                  No open Futures / Options positions. When F&amp;O trades are open they appear here with lot multiplier,
-                  notional, and SPAN-style paper margin.
-                </p>
-              ) : (
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      <th>Product</th>
+                      <th>CE/PE</th>
+                      <th>Strike</th>
+                      <th>Expiry</th>
                       <th>Side</th>
                       <th>Lots</th>
                       <th>Mult</th>
-                      <th>Notional</th>
+                      <th>LTP</th>
                       <th>Margin</th>
                       <th>PnL</th>
                     </tr>
                   </thead>
                   <tbody>
                     {marginBook.fno.map((p) => (
-                      <tr key={`fo-${p.position_id}-${p.symbol}-${p.product}`}>
+                      <tr
+                        key={`fo-${p.position_id}-${p.symbol}-${p.product}`}
+                        style={{ cursor: 'pointer' }}
+                        onClick={() => {
+                          setSearchQuery(p.symbol)
+                          void loadFnoSymbol(p.symbol, p.expiry || undefined)
+                        }}
+                      >
                         <td>{p.symbol}</td>
                         <td>
                           {p.product} · {p.trade_type}
                         </td>
                         <td>
+                          <span className={`pill ${p.option_type === 'PE' ? 'sell' : 'buy'}`}>
+                            {p.option_type || (p.product === 'Futures' ? 'FUT' : '—')}
+                          </span>
+                        </td>
+                        <td>{p.strike != null ? p.strike : '—'}</td>
+                        <td>{p.expiry_label || p.expiry || '—'}</td>
+                        <td>
                           <span className={`pill ${p.side === 'BUY' ? 'buy' : 'sell'}`}>{p.side}</span>
                         </td>
                         <td>{p.quantity}</td>
                         <td>{p.multiplier}</td>
-                        <td>{inr(p.notional)}</td>
+                        <td>{inrDec(p.ltp)}</td>
                         <td>
                           {inr(p.margin_required)}
                           <span className="muted"> ({p.margin_pct}%)</span>
@@ -1207,29 +1153,200 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
-              )}
-              {marginBook && (
-                <div className="rec-grid" style={{ marginTop: '1rem' }}>
+              </div>
+            )}
+          </section>
+
+          <section className="panel" style={{ marginBottom: '1rem' }}>
+            <div className="panel-head">
+              <h2>Expiry Dates · Call (CE) / Put (PE)</h2>
+              <div className="actions">
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={searchBusy}
+                  onClick={() => void loadFnoSymbol(searchSymbol || 'NIFTY')}
+                >
+                  {searchBusy ? 'Loading…' : 'Load Chain'}
+                </button>
+              </div>
+            </div>
+            <p className="empty" style={{ marginBottom: '0.75rem' }}>
+              Select an underlying to view futures basis, expiry chips, and the full CE/PE option chain.
+            </p>
+            <div className="chips" style={{ marginBottom: '0.75rem' }}>
+              {['NIFTY', 'BANKNIFTY', 'RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'SBIN', 'ICICIBANK'].map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  className="chip"
+                  style={{
+                    cursor: 'pointer',
+                    border: 'none',
+                    background: searchSymbol === s ? 'var(--teal-dim)' : undefined,
+                    color: searchSymbol === s ? 'var(--teal)' : undefined,
+                  }}
+                  onClick={() => {
+                    setSearchQuery(s)
+                    void loadFnoSymbol(s)
+                  }}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            {searchError && (
+              <div className="emergency-banner" style={{ marginBottom: '0.75rem' }}>
+                {searchError}{' '}
+                <button className="btn" type="button" onClick={() => void loadFnoSymbol(searchSymbol || 'NIFTY')}>
+                  Retry
+                </button>
+              </div>
+            )}
+            {searchBusy && !fnoOverview && <p className="empty">Loading F&amp;O chain for {searchSymbol || 'NIFTY'}…</p>}
+
+            {fnoOverview && (
+              <>
+                <div className="panel-head">
+                  <h2 style={{ fontSize: '1rem' }}>
+                    {fnoOverview.symbol} · Spot {inrDec(fnoOverview.spot)}
+                  </h2>
+                  <span className={`pill ${(fnoOverview.change_pct || 0) >= 0 ? 'buy' : 'sell'}`}>
+                    {pct(fnoOverview.change_pct || 0)}
+                  </span>
+                </div>
+                <div className="rec-grid" style={{ marginBottom: '0.75rem' }}>
                   <div className="rec-cell">
-                    <span>Futures margin</span>
-                    <strong>{inr(marginBook.by_segment.futures.margin_used)}</strong>
+                    <span>Futures LTP</span>
+                    <strong>{inrDec(fnoOverview.futures?.ltp ?? 0)}</strong>
                   </div>
                   <div className="rec-cell">
-                    <span>Options margin</span>
-                    <strong>{inr(marginBook.by_segment.options.margin_used)}</strong>
+                    <span>Basis</span>
+                    <strong>
+                      {inrDec(fnoOverview.futures?.basis ?? 0)} ({fnoOverview.futures?.basis_pct ?? 0}%)
+                    </strong>
                   </div>
                   <div className="rec-cell">
-                    <span>F&amp;O total margin</span>
-                    <strong>{inr(marginBook.fo_total_margin)}</strong>
+                    <span>Fut lot</span>
+                    <strong>{fnoOverview.futures?.lot_size ?? '—'}</strong>
                   </div>
                   <div className="rec-cell">
-                    <span>F&amp;O exposure</span>
-                    <strong>{inr(marginBook.fo_total_exposure)}</strong>
+                    <span>ATR</span>
+                    <strong>{inrDec(fnoOverview.atr)}</strong>
                   </div>
                 </div>
-              )}
-            </section>
-          </div>
+
+                <div className="panel-head" style={{ marginTop: '0.5rem' }}>
+                  <h2 style={{ fontSize: '1rem' }}>Expiry Dates</h2>
+                </div>
+                <div className="chips" style={{ marginBottom: '0.75rem' }}>
+                  {(fnoOverview.expiries || []).map((ex) => (
+                    <button
+                      key={ex.expiry}
+                      type="button"
+                      className="chip"
+                      style={{
+                        cursor: 'pointer',
+                        border: 'none',
+                        background: selectedExpiry === ex.expiry ? 'var(--teal-dim)' : undefined,
+                        color: selectedExpiry === ex.expiry ? 'var(--teal)' : undefined,
+                      }}
+                      onClick={() => void changeExpiry(ex.expiry)}
+                    >
+                      {ex.label} · {ex.kind} · {ex.days_to_expiry}d
+                    </button>
+                  ))}
+                </div>
+
+                {optionChain ? (
+                  <>
+                    <div className="rec-grid" style={{ marginBottom: '0.75rem' }}>
+                      <div className="rec-cell">
+                        <span>Expiry</span>
+                        <strong>{optionChain.expiry_label}</strong>
+                      </div>
+                      <div className="rec-cell">
+                        <span>ATM</span>
+                        <strong>{optionChain.atm_strike}</strong>
+                      </div>
+                      <div className="rec-cell">
+                        <span>PCR</span>
+                        <strong>{optionChain.pcr ?? '—'}</strong>
+                      </div>
+                      <div className="rec-cell">
+                        <span>Max Pain</span>
+                        <strong>{optionChain.max_pain}</strong>
+                      </div>
+                      <div className="rec-cell">
+                        <span>IV ATM</span>
+                        <strong>{optionChain.iv_atm_pct}%</strong>
+                      </div>
+                      <div className="rec-cell">
+                        <span>Opt lot</span>
+                        <strong>{optionChain.lot_size}</strong>
+                      </div>
+                    </div>
+                    <p className="empty" style={{ marginBottom: '0.5rem' }}>
+                      {optionChain.note}
+                    </p>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table className="table option-chain">
+                        <thead>
+                          <tr>
+                            <th colSpan={4} style={{ textAlign: 'center', color: 'var(--teal)' }}>
+                              CALL (CE)
+                            </th>
+                            <th style={{ textAlign: 'center' }}>Strike</th>
+                            <th colSpan={4} style={{ textAlign: 'center', color: 'var(--amber)' }}>
+                              PUT (PE)
+                            </th>
+                          </tr>
+                          <tr>
+                            <th>OI</th>
+                            <th>Vol</th>
+                            <th>IV%</th>
+                            <th>LTP</th>
+                            <th>Strike</th>
+                            <th>LTP</th>
+                            <th>IV%</th>
+                            <th>Vol</th>
+                            <th>OI</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(optionChain.rows || []).map((row) => (
+                            <tr
+                              key={row.strike}
+                              style={{
+                                background: row.is_atm ? 'rgba(62, 207, 172, 0.08)' : undefined,
+                              }}
+                            >
+                              <td>{(row.call?.oi ?? 0).toLocaleString('en-IN')}</td>
+                              <td>{(row.call?.volume ?? 0).toLocaleString('en-IN')}</td>
+                              <td>{(row.call?.iv ?? 0).toFixed(1)}</td>
+                              <td className="pos">{inrDec(row.call?.ltp ?? 0)}</td>
+                              <td>
+                                <strong>
+                                  {row.strike}
+                                  {row.is_atm ? ' · ATM' : ''}
+                                </strong>
+                              </td>
+                              <td className="neg">{inrDec(row.put?.ltp ?? 0)}</td>
+                              <td>{(row.put?.iv ?? 0).toFixed(1)}</td>
+                              <td>{(row.put?.volume ?? 0).toLocaleString('en-IN')}</td>
+                              <td>{(row.put?.oi ?? 0).toLocaleString('en-IN')}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : (
+                  <p className="empty">{searchBusy ? 'Loading CE/PE chain…' : 'Select an expiry to load Call / Put.'}</p>
+                )}
+              </>
+            )}
+          </section>
         </div>
       )}
 
