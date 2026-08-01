@@ -507,6 +507,14 @@ export const api = {
         phase?: number
         description?: string
       }>
+      styles_count?: number
+      styles?: Array<{
+        id: string
+        name: string
+        strategies: string[]
+        strategies_available: string[]
+        family?: string
+      }>
       learning?: Record<string, unknown>
       note?: string
     }>('/api/strategies'),

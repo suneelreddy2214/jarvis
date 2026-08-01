@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -114,9 +115,33 @@ def _llm_store(op: str, key: str, value=None):
 chat_assistant = QuantXChat(_chat_context, settings_store=_llm_store)
 
 
+def _backend_style_self_train() -> None:
+    """AI trading-style self-train — backend only (no UI trigger)."""
+    try:
+        logger.info("Backend trading-styles self-train starting…")
+        result = train_trading_styles(
+            backtester=backtester,
+            learner=StrategyLearner(db),
+            period="6mo",
+            max_symbols_per_strategy=2,
+        )
+        logger.info(
+            "Backend style self-train complete — %s strategies / %s backtests",
+            len(result.get("strategies_trained") or []),
+            result.get("backtests_run", 0),
+        )
+    except Exception:
+        logger.exception("Backend style self-train failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("QuantX %s starting in %s mode", __version__, settings.agent.mode)
+    threading.Thread(
+        target=_backend_style_self_train,
+        name="quantx-style-self-train",
+        daemon=True,
+    ).start()
     yield
     if paper_agent.stats.running:
         paper_agent.stop()
@@ -508,7 +533,7 @@ def strategies():
         "styles_count": len(styles),
         "styles": styles,
         "learning": StrategyLearner(db).as_dict(),
-        "note": "Core strategies preserved; additive + trading-style strategies registered. Self-train via POST /api/styles/train.",
+        "note": "Core strategies preserved; additive + trading-style strategies registered. Self-train runs on backend startup (POST /api/styles/train still available).",
     }
 
 
