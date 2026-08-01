@@ -22,6 +22,9 @@ risk:
   max_aggregate_open_risk_pct: 3.0  # Sum of capital_at_risk across opens
   max_trades_per_day: 5
   include_unrealized_in_loss_limits: true
+  soft_daily_loss_pct: 1.0        # Soft halt new entries earlier
+  soft_weekly_loss_pct: 2.5
+  soft_drawdown_pct: 5.0
 
 markets:
   exchanges:
@@ -75,6 +78,8 @@ entry:
   min_confidence: 60
   min_fundamental_score: 50
   avoid_major_news: true
+  min_confluence_factors: 4
+  require_fundamental_metrics: true
 
 exit:
   use_atr_stop: true

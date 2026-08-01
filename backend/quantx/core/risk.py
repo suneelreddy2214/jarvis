@@ -131,6 +131,23 @@ class RiskManager:
         if self.state.trades_today >= self.cfg.max_trades_per_day:
             reasons.append(f"Max trades/day {self.cfg.max_trades_per_day} reached")
 
+        # Soft throttles — stop NEW risk before hard kill limits (post-mortem: halted too late)
+        soft_daily = float(getattr(self.cfg, "soft_daily_loss_pct", 1.0) or 1.0)
+        soft_weekly = float(getattr(self.cfg, "soft_weekly_loss_pct", 2.5) or 2.5)
+        soft_dd = float(getattr(self.cfg, "soft_drawdown_pct", 5.0) or 5.0)
+        if self.daily_loss_pct >= soft_daily:
+            reasons.append(
+                f"Soft daily loss throttle {self.daily_loss_pct:.2f}% >= {soft_daily}% — no new entries"
+            )
+        if self.weekly_loss_pct >= soft_weekly:
+            reasons.append(
+                f"Soft weekly loss throttle {self.weekly_loss_pct:.2f}% >= {soft_weekly}% — no new entries"
+            )
+        if self.drawdown_pct >= soft_dd and not self.state.max_drawdown_lock:
+            reasons.append(
+                f"Soft drawdown throttle {self.drawdown_pct:.2f}% >= {soft_dd}% — no new entries"
+            )
+
         if reasons and not self.state.manual_override:
             self.state.trading_halted = True
             self.state.halt_reason = "; ".join(reasons)

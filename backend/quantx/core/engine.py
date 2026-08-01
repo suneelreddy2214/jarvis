@@ -207,6 +207,16 @@ class QuantXEngine:
                 rejects.append(f"Fundamental score {fund.score:.0f} < {entry_cfg.min_fundamental_score}")
             elif fund.score < entry_cfg.min_fundamental_score - 15:
                 rejects.append(f"Fundamental score {fund.score:.0f} too weak for stock F&O")
+        # Equity swing must not be tech-only when fundamentals are sparse
+        require_fund_metrics = bool(getattr(entry_cfg, "require_fundamental_metrics", True))
+        fund_quality = getattr(fund, "data_quality", "unknown")
+        if (
+            require_fund_metrics
+            and not index_sym
+            and trade_type == TradeType.SWING
+            and fund_quality == "sparse"
+        ):
+            rejects.append("Sparse fundamentals — refuse tech-only swing entry")
         if macro.avoid_new_risk and entry_cfg.avoid_major_news:
             rejects.append(f"Macro risk elevated: {macro.summary}")
         if risk_scale <= 0:
@@ -226,10 +236,37 @@ class QuantXEngine:
         ):
             rejects.append("Nifty bullish — no fresh shorts (macro alignment)")
 
+        # USDINR / VIX caution → extra size cut already in macro; raise bar
+        if getattr(macro, "require_extra_confirmation", False):
+            risk_scale = min(risk_scale, 0.65)
+
         # Weak/missing fundamentals: demand stronger technical confidence + half size
-        weak_fundamentals = (not index_sym) and fund.score <= 50
+        weak_fundamentals = (not index_sym) and (fund.score <= 50 or fund_quality in ("sparse", "partial"))
         if weak_fundamentals:
             risk_scale = min(risk_scale, 0.5)
+
+        # Multi-factor confluence: trend, momentum, volume, ADX, macro, fundamentals
+        confluence: list[str] = []
+        if snap.trend in (MarketDirection.BULLISH, MarketDirection.BEARISH):
+            confluence.append("trend")
+        if snap.momentum not in ("neutral",):
+            confluence.append("momentum")
+        if snap.volume_ratio >= min_vol:
+            confluence.append("volume")
+        if snap.adx >= min_adx:
+            confluence.append("adx")
+        if not macro.avoid_new_risk and nifty_bias != ("bearish" if side == Side.BUY else "bullish"):
+            confluence.append("macro")
+        if index_sym or (fund.score >= entry_cfg.min_fundamental_score and fund_quality != "sparse"):
+            confluence.append("fundamental")
+        min_factors = int(getattr(entry_cfg, "min_confluence_factors", 4) or 4)
+        if getattr(macro, "require_extra_confirmation", False):
+            min_factors = max(min_factors, 5)
+        if trade_type == TradeType.SWING and len(confluence) < min_factors:
+            rejects.append(
+                f"Confluence {len(confluence)}/{min_factors} weak "
+                f"({', '.join(confluence) or 'none'}) — need trend/momentum/vol/ADX/macro/fund"
+            )
 
         # --- Product-specific levels & sizing ---
         futures_note = ""
@@ -395,6 +432,8 @@ class QuantXEngine:
                 f"ATR={snap.atr:.2f}. Product={trade_type.value}. "
                 f"Price source={price_source}"
                 + (f" ({yahoo_sym})" if yahoo_sym else "")
+                + f". Confluence={len(confluence)}:{','.join(confluence)}"
+                + (f". Macro flags={','.join(getattr(macro, 'caution_flags', []) or [])}" if getattr(macro, "caution_flags", None) else "")
                 + ". "
                 + (size.notes or "")
             ),
@@ -473,6 +512,12 @@ class QuantXEngine:
             conf -= 15
         if getattr(macro, "size_multiplier", 1.0) < 1.0:
             conf -= 8
+        if getattr(macro, "require_extra_confirmation", False):
+            conf -= 5
+        if "vix_complacency" in getattr(macro, "caution_flags", []):
+            conf -= 5
+        if "inr_weak" in getattr(macro, "caution_flags", []):
+            conf -= 5
         if snap.adx < 20:
             conf -= 10
         conf = max(0, min(100, conf))

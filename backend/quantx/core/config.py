@@ -27,6 +27,10 @@ class RiskConfig(BaseModel):
     max_aggregate_open_risk_pct: float = 3.0
     max_trades_per_day: int = 5
     include_unrealized_in_loss_limits: bool = True
+    # Soft throttles — halt new entries before hard kill thresholds
+    soft_daily_loss_pct: float = 1.0
+    soft_weekly_loss_pct: float = 2.5
+    soft_drawdown_pct: float = 5.0
 
 
 class CapitalConfig(BaseModel):
@@ -73,6 +77,8 @@ class EntryConfig(BaseModel):
     min_confidence: int = 60
     min_fundamental_score: int = 50
     avoid_major_news: bool = True
+    min_confluence_factors: int = 4
+    require_fundamental_metrics: bool = True
 
 
 class ExitConfig(BaseModel):

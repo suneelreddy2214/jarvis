@@ -1,4 +1,4 @@
-"""Lightweight fundamental scoring for Indian equities (placeholder + heuristics)."""
+"""Lightweight fundamental scoring for Indian equities (Yahoo info + heuristics)."""
 
 from __future__ import annotations
 
@@ -11,19 +11,20 @@ class FundamentalScore:
     score: float  # 0-100
     summary: str
     metrics: dict[str, Any]
+    data_quality: str = "unknown"  # rich | partial | sparse
 
 
 class FundamentalAnalyzer:
     """
-    Scores fundamentals from available metadata.
-    When live fundamental APIs are unavailable, uses conservative neutral scoring
-    and clearly labels data limitations — never fabricates precision.
+    Scores fundamentals from Yahoo metadata.
+    Sparse data is scored below the equity entry floor so paper swing trades
+    cannot rely on technicals alone.
     """
 
     def analyze(self, symbol: str, info: Optional[dict] = None) -> FundamentalScore:
         info = info or {}
         metrics: dict[str, Any] = {}
-        score = 55.0  # neutral baseline when data sparse
+        score = 55.0
         notes: list[str] = []
 
         pe = info.get("trailingPE") or info.get("pe")
@@ -32,6 +33,29 @@ class FundamentalAnalyzer:
         de = info.get("debtToEquity")
         margin = info.get("profitMargins")
         growth = info.get("revenueGrowth")
+        sector = info.get("sector")
+        industry = info.get("industry")
+        mcap = info.get("marketCap")
+        div = info.get("dividendYield")
+
+        if sector:
+            metrics["sector"] = sector
+            notes.append(f"Sector {sector}")
+        if industry:
+            metrics["industry"] = industry
+        if mcap is not None:
+            try:
+                metrics["market_cap_cr"] = round(float(mcap) / 1e7, 1)
+            except Exception:
+                pass
+        if div is not None:
+            try:
+                d = float(div) * 100 if abs(float(div)) <= 1 else float(div)
+                metrics["dividend_yield"] = round(d, 2)
+                if d >= 2:
+                    score += 3
+            except Exception:
+                pass
 
         if pe is not None:
             metrics["pe"] = round(float(pe), 2)
@@ -91,10 +115,27 @@ class FundamentalAnalyzer:
                 score -= 10
                 notes.append("Revenue contraction")
 
-        if not metrics:
-            notes.append("Limited fundamental data — relying on technical confluence; size conservatively")
-            score = 50.0
+        numeric_keys = {"pe", "pb", "roe", "debt_equity", "profit_margin", "revenue_growth"}
+        numeric_count = sum(1 for k in numeric_keys if k in metrics)
+
+        if numeric_count == 0:
+            # Sparse fundamentals must not pass equity swing floor (min_fundamental_score)
+            notes.append(
+                "Sparse fundamental data — block tech-only equity entries; size conservatively if F&O"
+            )
+            score = 40.0
+            data_quality = "sparse"
+        elif numeric_count < 3:
+            notes.append("Partial fundamentals — demand stronger technical confluence")
+            score = min(score, 58.0)
+            data_quality = "partial"
+        else:
+            data_quality = "rich"
 
         score = max(0.0, min(100.0, score))
-        summary = f"{symbol}: score {score:.0f}/100. " + ("; ".join(notes) if notes else "Neutral.")
-        return FundamentalScore(score=score, summary=summary, metrics=metrics)
+        summary = f"{symbol}: score {score:.0f}/100 ({data_quality}). " + (
+            "; ".join(notes) if notes else "Neutral."
+        )
+        return FundamentalScore(
+            score=score, summary=summary, metrics=metrics, data_quality=data_quality
+        )

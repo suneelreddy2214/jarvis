@@ -133,6 +133,26 @@ class MarketDataService:
         )
         self.last_source: str = "unknown"
         self.last_error: Optional[str] = None
+        self._yahoo_crumb: Optional[str] = None
+        self._crumb_fetched_at: float = 0.0
+
+    def _ensure_yahoo_crumb(self, force: bool = False) -> Optional[str]:
+        """Yahoo quoteSummary requires a crumb + cookie (A3)."""
+        now = time.time()
+        if not force and self._yahoo_crumb and now - self._crumb_fetched_at < 3600:
+            return self._yahoo_crumb
+        try:
+            self._session.get("https://fc.yahoo.com", timeout=10)
+            resp = self._session.get(
+                "https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10
+            )
+            if resp.status_code == 200 and resp.text and "Too Many" not in resp.text:
+                self._yahoo_crumb = resp.text.strip()
+                self._crumb_fetched_at = now
+                return self._yahoo_crumb
+        except Exception as e:
+            logger.warning("Yahoo crumb fetch failed: %s", e)
+        return self._yahoo_crumb
 
     # ------------------------------------------------------------------
     # Public API
@@ -286,7 +306,13 @@ class MarketDataService:
         ysym = to_yahoo_symbol(symbol, exchange)
         if not self.use_live:
             return {}
-        # Prefer chart meta; fundamentals via yfinance when available
+        # Prefer Yahoo quoteSummary modules (more reliable than yfinance .info under 429s)
+        try:
+            info = self._yahoo_quote_summary(ysym)
+            if info:
+                return info
+        except Exception as e:
+            logger.warning("Yahoo quoteSummary failed for %s: %s", ysym, e)
         try:
             import yfinance as yf
 
@@ -307,6 +333,81 @@ class MarketDataService:
         except Exception as e:
             logger.warning("info fetch failed for %s: %s", ysym, e)
             return {}
+
+    def _yahoo_quote_summary(self, ysym: str) -> dict:
+        modules = "summaryDetail,defaultKeyStatistics,financialData,assetProfile"
+        last_err: Optional[Exception] = None
+        crumb = self._ensure_yahoo_crumb()
+        for host in YAHOO_CHART_HOSTS:
+            url = f"{host}/v10/finance/quoteSummary/{ysym}"
+            try:
+                params: dict[str, str] = {"modules": modules}
+                if crumb:
+                    params["crumb"] = crumb
+                resp = self._session.get(url, params=params, timeout=15)
+                if resp.status_code in (401, 403) and crumb:
+                    crumb = self._ensure_yahoo_crumb(force=True)
+                    if crumb:
+                        params["crumb"] = crumb
+                        resp = self._session.get(url, params=params, timeout=15)
+                if resp.status_code == 429:
+                    time.sleep(0.4)
+                    continue
+                if resp.status_code >= 400:
+                    last_err = YahooFinanceError(f"quoteSummary HTTP {resp.status_code}")
+                    continue
+                data = resp.json()
+                result = ((data.get("quoteSummary") or {}).get("result") or [None])[0]
+                if not result:
+                    continue
+                summary = result.get("summaryDetail") or {}
+                keystat = result.get("defaultKeyStatistics") or {}
+                financial = result.get("financialData") or {}
+                profile = result.get("assetProfile") or {}
+
+                def _raw(node, field):
+                    block = node.get(field)
+                    if isinstance(block, dict):
+                        return block.get("raw", block.get("fmt"))
+                    return block
+
+                out = {}
+                pe = _raw(summary, "trailingPE") or _raw(keystat, "trailingPE")
+                pb = _raw(keystat, "priceToBook")
+                roe = _raw(financial, "returnOnEquity")
+                de = _raw(financial, "debtToEquity")
+                margin = _raw(financial, "profitMargins")
+                growth = _raw(financial, "revenueGrowth")
+                mcap = _raw(summary, "marketCap")
+                div = _raw(summary, "dividendYield")
+                if pe is not None:
+                    out["trailingPE"] = float(pe)
+                if pb is not None:
+                    out["priceToBook"] = float(pb)
+                if roe is not None:
+                    out["returnOnEquity"] = float(roe)
+                if de is not None:
+                    # Yahoo financialData.debtToEquity is percent-style (e.g. 9.5 → 0.095)
+                    out["debtToEquity"] = float(de) / 100.0
+                if margin is not None:
+                    out["profitMargins"] = float(margin)
+                if growth is not None:
+                    out["revenueGrowth"] = float(growth)
+                if mcap is not None:
+                    out["marketCap"] = float(mcap)
+                if div is not None:
+                    out["dividendYield"] = float(div)
+                if profile.get("sector"):
+                    out["sector"] = profile["sector"]
+                if profile.get("industry"):
+                    out["industry"] = profile["industry"]
+                return out
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            raise YahooFinanceError(str(last_err))
+        return {}
 
     def get_macro_snapshot(self) -> dict:
         out: dict = {}
