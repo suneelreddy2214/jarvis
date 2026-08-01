@@ -39,33 +39,40 @@ class PositionSizer:
         max_quantity: Optional[int] = None,
         broker_margin_pct: float = 100.0,
         quantity_as_lots: bool = False,
+        risk_scale: float = 1.0,
     ) -> PositionSizeResult:
         """
         Calculate position size so that loss at stop ≈ risk_per_trade_pct of capital.
 
         When quantity_as_lots=True (F&O), quantity is number of lots and
         lot_size is the contract multiplier (e.g. NIFTY=25).
+        risk_scale < 1 reduces size in elevated-volatility regimes.
         """
-        risk_pct = self.settings.risk.max_risk_per_trade_pct
+        scale = max(0.0, min(1.0, float(risk_scale)))
+        risk_pct = self.settings.risk.max_risk_per_trade_pct * scale
         risk_amount = capital * (risk_pct / 100.0)
 
         stop_distance = abs(entry - stop_loss)
-        if stop_distance <= 0:
+        if stop_distance <= 0 or scale <= 0:
             return PositionSizeResult(
                 quantity=0,
                 capital_at_risk=0.0,
                 stop_distance=0.0,
                 risk_pct=0.0,
                 method=self.settings.position_sizing.method,
-                notes="Invalid stop distance — trade rejected",
+                notes="Invalid stop / risk scale — trade rejected",
             )
 
         method = self.settings.position_sizing.method
         notes = ""
+        if scale < 0.999:
+            notes = f"Size scaled {scale:.0%} for macro/vol"
         if method == "atr" and atr and atr > 0 and not quantity_as_lots:
             min_stop = atr * self.settings.position_sizing.atr_multiplier
             if stop_distance < min_stop * 0.5:
-                notes = f"Stop unusually tight vs ATR({atr:.2f}); size reduced for safety"
+                notes = (notes + "; " if notes else "") + (
+                    f"Stop unusually tight vs ATR({atr:.2f}); size reduced for safety"
+                )
                 stop_distance = max(stop_distance, min_stop * 0.5)
 
         mult = max(1, int(lot_size))
@@ -109,14 +116,15 @@ class PositionSizer:
             )
 
         actual_risk_pct = (capital_at_risk / capital * 100) if capital else 0.0
+        max_allowed = self.settings.risk.max_risk_per_trade_pct
 
-        if actual_risk_pct > risk_pct + 0.01:
+        if actual_risk_pct > max_allowed + 0.01:
             if quantity_as_lots:
                 risk_per_lot = stop_distance * mult
-                quantity = int(risk_amount // risk_per_lot) if risk_per_lot > 0 else 0
+                quantity = int((capital * max_allowed / 100.0) // risk_per_lot) if risk_per_lot > 0 else 0
                 capital_at_risk = quantity * risk_per_lot
             else:
-                quantity = int((risk_amount / stop_distance) // mult) * mult
+                quantity = int(((capital * max_allowed / 100.0) / stop_distance) // mult) * mult
                 capital_at_risk = quantity * stop_distance
             actual_risk_pct = (capital_at_risk / capital * 100) if capital else 0.0
 

@@ -7,11 +7,15 @@ All trade proposals must pass these gates before execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from quantx.core.config import RiskConfig, Settings, get_settings
 from quantx.core.models import RiskStatus, Side, TradeRecommendation
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass
@@ -20,14 +24,18 @@ class RiskState:
     peak_capital: float
     daily_realized_pnl: float = 0.0
     weekly_realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
     open_positions: int = 0
     consecutive_losses: int = 0
+    trades_today: int = 0
     kill_switch: bool = False
     max_drawdown_lock: bool = False
     manual_override: bool = False
     trading_halted: bool = False
     halt_reason: Optional[str] = None
     open_risk_amount: float = 0.0
+    risk_day: Optional[str] = None  # YYYY-MM-DD IST
+    risk_week: Optional[str] = None  # ISO week key
 
 
 class RiskManager:
@@ -41,41 +49,70 @@ class RiskManager:
             peak_capital=self.settings.capital.initial,
         )
 
+    @staticmethod
+    def _today_ist() -> date:
+        return datetime.now(IST).date()
+
+    @staticmethod
+    def _week_key(d: Optional[date] = None) -> str:
+        d = d or RiskManager._today_ist()
+        iso = d.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+
+    def ensure_period_rolls(self) -> None:
+        """Reset daily/weekly counters on IST calendar boundaries."""
+        today = self._today_ist().isoformat()
+        week = self._week_key()
+        if self.state.risk_day and self.state.risk_day != today:
+            self.state.daily_realized_pnl = 0.0
+            self.state.consecutive_losses = 0
+            self.state.trades_today = 0
+        if self.state.risk_week and self.state.risk_week != week:
+            self.state.weekly_realized_pnl = 0.0
+        self.state.risk_day = today
+        self.state.risk_week = week
+
     def update_state(self, **kwargs) -> None:
         for k, v in kwargs.items():
             if hasattr(self.state, k):
                 setattr(self.state, k, v)
         if self.state.capital > self.state.peak_capital:
             self.state.peak_capital = self.state.capital
+        self.ensure_period_rolls()
         self._recompute_halt()
+
+    def _loss_base(self, period_pnl: float) -> float:
+        base = self.state.capital - period_pnl
+        return base if base > 0 else 0.0
+
+    def _period_loss_pct(self, period_pnl: float) -> float:
+        """Loss % vs period-start capital; optionally folds in open unrealized."""
+        pnl = period_pnl
+        if self.cfg.include_unrealized_in_loss_limits:
+            pnl = period_pnl + float(self.state.unrealized_pnl or 0.0)
+        base = self._loss_base(period_pnl)
+        if base <= 0:
+            return 0.0
+        loss = min(0.0, pnl)
+        return abs(loss) / base * 100
 
     @property
     def drawdown_pct(self) -> float:
         if self.state.peak_capital <= 0:
             return 0.0
-        return max(0.0, (self.state.peak_capital - self.state.capital) / self.state.peak_capital * 100)
+        equity = self.state.capital + float(self.state.unrealized_pnl or 0.0)
+        return max(0.0, (self.state.peak_capital - equity) / self.state.peak_capital * 100)
 
     @property
     def daily_loss_pct(self) -> float:
-        if self.state.capital <= 0:
-            return 0.0
-        base = self.state.capital - self.state.daily_realized_pnl
-        if base <= 0:
-            return 0.0
-        loss = min(0.0, self.state.daily_realized_pnl)
-        return abs(loss) / base * 100
+        return self._period_loss_pct(self.state.daily_realized_pnl)
 
     @property
     def weekly_loss_pct(self) -> float:
-        if self.state.capital <= 0:
-            return 0.0
-        base = self.state.capital - self.state.weekly_realized_pnl
-        if base <= 0:
-            return 0.0
-        loss = min(0.0, self.state.weekly_realized_pnl)
-        return abs(loss) / base * 100
+        return self._period_loss_pct(self.state.weekly_realized_pnl)
 
     def _recompute_halt(self) -> None:
+        self.ensure_period_rolls()
         reasons: list[str] = []
 
         if self.state.kill_switch:
@@ -91,6 +128,8 @@ class RiskManager:
             reasons.append(f"Weekly loss {self.weekly_loss_pct:.2f}% >= limit {self.cfg.max_weekly_loss_pct}%")
         if self.state.consecutive_losses >= self.cfg.max_consecutive_losses:
             reasons.append(f"Consecutive losses {self.state.consecutive_losses} >= {self.cfg.max_consecutive_losses}")
+        if self.state.trades_today >= self.cfg.max_trades_per_day:
+            reasons.append(f"Max trades/day {self.cfg.max_trades_per_day} reached")
 
         if reasons and not self.state.manual_override:
             self.state.trading_halted = True
@@ -115,8 +154,15 @@ class RiskManager:
             can_trade = False
             reasons.append(f"Max open positions ({self.cfg.max_open_positions}) reached")
 
+        agg_cap = self.state.capital * (self.cfg.max_aggregate_open_risk_pct / 100.0)
+        if self.state.open_risk_amount >= agg_cap > 0:
+            can_trade = False
+            reasons.append(
+                f"Aggregate open risk ₹{self.state.open_risk_amount:.0f} "
+                f">= {self.cfg.max_aggregate_open_risk_pct}% cap"
+            )
+
         risk_budget = self.state.capital * (self.cfg.max_risk_per_trade_pct / 100)
-        remaining = max(0.0, risk_budget)  # per-trade budget; open risk tracked separately
 
         return RiskStatus(
             can_trade=can_trade,
@@ -126,7 +172,7 @@ class RiskManager:
             drawdown_pct=self.drawdown_pct,
             open_positions=self.state.open_positions,
             consecutive_losses=self.state.consecutive_losses,
-            risk_budget_remaining=remaining,
+            risk_budget_remaining=max(0.0, risk_budget),
         )
 
     def validate_recommendation(self, rec: TradeRecommendation) -> tuple[bool, list[str]]:
@@ -142,6 +188,15 @@ class RiskManager:
         if risk_pct > self.cfg.max_risk_per_trade_pct + 1e-6:
             reasons.append(
                 f"Risk {risk_pct:.2f}% exceeds max {self.cfg.max_risk_per_trade_pct}% per trade"
+            )
+
+        # Aggregate open risk after this trade
+        agg_cap = self.state.capital * (self.cfg.max_aggregate_open_risk_pct / 100.0)
+        projected = self.state.open_risk_amount + float(rec.capital_at_risk or 0)
+        if agg_cap > 0 and projected > agg_cap + 1e-6:
+            reasons.append(
+                f"Projected aggregate open risk ₹{projected:.0f} exceeds "
+                f"{self.cfg.max_aggregate_open_risk_pct}% cap (₹{agg_cap:.0f})"
             )
 
         # Risk-reward
@@ -166,12 +221,11 @@ class RiskManager:
         if rec.quantity <= 0:
             reasons.append("Quantity must be positive")
 
-        # Never average losing trades — checked at portfolio layer when adding
-
         return (len(reasons) == 0, reasons)
 
     def register_trade_result(self, pnl: float) -> None:
         """Update consecutive loss streak and PnL after a closed trade."""
+        self.ensure_period_rolls()
         self.state.daily_realized_pnl += pnl
         self.state.weekly_realized_pnl += pnl
         self.state.capital += pnl
@@ -181,6 +235,12 @@ class RiskManager:
             self.state.consecutive_losses = 0
         if self.state.capital > self.state.peak_capital:
             self.state.peak_capital = self.state.capital
+        self._recompute_halt()
+
+    def register_entry(self) -> None:
+        """Count a new fill toward the daily trade budget."""
+        self.ensure_period_rolls()
+        self.state.trades_today += 1
         self._recompute_halt()
 
     def activate_kill_switch(self, reason: str = "Manual kill switch") -> None:
@@ -196,8 +256,11 @@ class RiskManager:
     def reset_daily(self) -> None:
         self.state.daily_realized_pnl = 0.0
         self.state.consecutive_losses = 0
+        self.state.trades_today = 0
+        self.state.risk_day = self._today_ist().isoformat()
         self._recompute_halt()
 
     def reset_weekly(self) -> None:
         self.state.weekly_realized_pnl = 0.0
+        self.state.risk_week = self._week_key()
         self._recompute_halt()

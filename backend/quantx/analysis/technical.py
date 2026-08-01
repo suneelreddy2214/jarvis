@@ -311,7 +311,7 @@ class TechnicalAnalyzer:
         return None
 
     def levels_for_trade(
-        self, snap: IndicatorSnapshot, side: Side, atr_stop_mult: float = 1.5
+        self, snap: IndicatorSnapshot, side: Side, atr_stop_mult: float = 2.0
     ) -> dict[str, float]:
         atr = max(snap.atr, snap.close * 0.005)
         entry = snap.close

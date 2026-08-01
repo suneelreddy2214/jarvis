@@ -395,8 +395,9 @@ class PaperTradingAgent:
             paper_cfg = getattr(self.settings, "paper", None) or {}
             if not isinstance(paper_cfg, dict):
                 paper_cfg = {}
-            max_fo = int(paper_cfg.get("max_fo_positions", 3))
+            max_fo = int(paper_cfg.get("max_fo_positions", 2))
             max_per_sym = int(paper_cfg.get("max_positions_per_symbol", 1))
+            max_new = int(paper_cfg.get("max_new_entries_per_cycle", 1))
             opens_now = self.portfolio.db.list_positions("OPEN")
             open_keys = {(p.symbol, p.trade_type.value) for p in opens_now}
             open_syms: dict[str, int] = {}
@@ -410,9 +411,13 @@ class PaperTradingAgent:
             slots = max_pos - len(opens_now)
             fo_skips_logged = False
             slot_skips_logged = False
+            entries_this_cycle = 0
             for rec in valid:
                 key = (rec.symbol, rec.trade_type.value)
                 is_fo = rec.trade_type in (TradeType.FUTURES, TradeType.OPTIONS)
+                if entries_this_cycle >= max_new:
+                    _skip(rec, f"Max new entries/cycle ({max_new}) — curb overtrading")
+                    continue
                 if slots <= 0:
                     if not slot_skips_logged:
                         _skip(rec, f"Max open positions ({max_pos}) — remaining signals skipped")
@@ -432,6 +437,14 @@ class PaperTradingAgent:
                         f"Max positions per symbol ({max_per_sym}) — diversify away from {rec.symbol}",
                     )
                     continue
+                if self.portfolio.symbol_on_cooldown(rec.symbol):
+                    _skip(rec, f"{rec.symbol} on post-stop cooldown — no revenge trade")
+                    continue
+                # Re-check risk each attempt (daily loss / consecutive / trade budget)
+                risk_now = self.portfolio.risk.status()
+                if not risk_now.can_trade:
+                    _skip(rec, f"Risk halt mid-cycle — {'; '.join(risk_now.reasons)}")
+                    break
                 fill = self.broker.retry_safe(rec)
                 if fill.get("status") == "FILLED":
                     executed.append(
@@ -448,6 +461,7 @@ class PaperTradingAgent:
                     open_keys.add(key)
                     open_syms[rec.symbol] = open_syms.get(rec.symbol, 0) + 1
                     slots -= 1
+                    entries_this_cycle += 1
                     if is_fo:
                         fo_open += 1
                     self.stats.executed += 1

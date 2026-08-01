@@ -15,6 +15,7 @@ class MacroContext:
     global_risk: str = "neutral"
     summary: str = ""
     avoid_new_risk: bool = False
+    size_multiplier: float = 1.0  # scale position size in elevated vol
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -44,19 +45,23 @@ class MacroAnalyzer:
         if india_vix is not None:
             ctx.vix_level = india_vix
             ctx.details["india_vix"] = india_vix
-            if india_vix >= 25:
+            if india_vix >= 20:
+                # Elevated VIX: hard-block fresh risk (post-mortem: ignored VIX caused large losses)
                 ctx.vix_regime = "elevated"
                 ctx.avoid_new_risk = True
-                parts.append(f"India VIX {india_vix:.1f} high — avoid fresh risk")
-            elif india_vix >= 20:
-                # Caution zone: size down via scoring, but do not hard-block every setup
+                ctx.size_multiplier = 0.0
+                parts.append(f"India VIX {india_vix:.1f} elevated — avoid fresh risk")
+            elif india_vix >= 18:
                 ctx.vix_regime = "elevated"
-                parts.append(f"India VIX {india_vix:.1f} elevated — trade selectively")
+                ctx.size_multiplier = 0.5
+                parts.append(f"India VIX {india_vix:.1f} caution — size down 50%")
             elif india_vix >= 15:
                 ctx.vix_regime = "moderate"
+                ctx.size_multiplier = 0.75
                 parts.append(f"India VIX {india_vix:.1f} moderate")
             else:
                 ctx.vix_regime = "low"
+                ctx.size_multiplier = 1.0
                 parts.append(f"India VIX {india_vix:.1f} calm")
 
         if usdinr_change_pct is not None:
@@ -68,10 +73,13 @@ class MacroAnalyzer:
                 ctx.usdinr_bias = "inr_strong"
                 parts.append(f"USDINR {usdinr_change_pct:.2f}% (INR firm)")
 
-        # Hard risk-off only when trend is down AND vol is clearly elevated
-        if ctx.nifty_bias == "bearish" and ctx.vix_regime == "elevated" and (india_vix or 0) >= 22:
+        # Extra risk-off when spot is weak even if VIX is only in caution band
+        if ctx.nifty_bias == "bearish" and (india_vix or 0) >= 18:
             ctx.global_risk = "risk_off"
             ctx.avoid_new_risk = True
+            ctx.size_multiplier = min(ctx.size_multiplier, 0.0)
+            if "avoid fresh risk" not in " ".join(parts).lower():
+                parts.append("Bearish Nifty + elevated vol — avoid fresh risk")
         elif ctx.nifty_bias == "bullish" and ctx.vix_regime == "low":
             ctx.global_risk = "risk_on"
 

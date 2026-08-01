@@ -19,11 +19,14 @@ class RiskConfig(BaseModel):
     max_risk_per_trade_pct: float = 1.0
     max_daily_loss_pct: float = 2.0
     max_weekly_loss_pct: float = 5.0
-    max_open_positions: int = 5
+    max_open_positions: int = 3
     min_risk_reward: float = 2.0
     max_consecutive_losses: int = 3
     max_drawdown_pct: float = 10.0
     min_liquidity_avg_volume: int = 100_000
+    max_aggregate_open_risk_pct: float = 3.0
+    max_trades_per_day: int = 5
+    include_unrealized_in_loss_limits: bool = True
 
 
 class CapitalConfig(BaseModel):
@@ -48,7 +51,7 @@ class MarketsConfig(BaseModel):
 
 class PositionSizingConfig(BaseModel):
     method: str = "atr"
-    atr_multiplier: float = 1.5
+    atr_multiplier: float = 2.0
     default_atr_period: int = 14
 
 
@@ -56,6 +59,9 @@ class EntryConfig(BaseModel):
     require_trend: bool = True
     require_momentum: bool = True
     require_volume: bool = True
+    require_adx: bool = True
+    min_adx: float = 20.0
+    min_volume_ratio: float = 1.0
     min_confidence: int = 60
     min_fundamental_score: int = 50
     avoid_major_news: bool = True
@@ -65,6 +71,7 @@ class ExitConfig(BaseModel):
     use_atr_stop: bool = True
     use_trailing_stop: bool = True
     trailing_atr_mult: float = 2.0
+    trail_after_r: float = 1.0  # only trail after this many R of favorable move
     time_exit_bars: int = 20
 
 
@@ -89,8 +96,10 @@ class Settings(BaseModel):
         default_factory=lambda: {
             "auto_execute": True,
             "enable_fno": True,
-            "max_fo_positions": 3,
+            "max_fo_positions": 2,
             "max_positions_per_symbol": 1,
+            "max_new_entries_per_cycle": 1,
+            "symbol_cooldown_hours": 24,
         }
     )
     logging: dict[str, Any] = Field(default_factory=dict)

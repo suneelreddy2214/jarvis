@@ -14,11 +14,14 @@ risk:
   max_risk_per_trade_pct: 1.0      # Never risk more than 1% per trade
   max_daily_loss_pct: 2.0         # Halt after 2% daily loss
   max_weekly_loss_pct: 5.0        # Halt after 5% weekly loss
-  max_open_positions: 5
+  max_open_positions: 3           # Cap concurrency to limit overtrading
   min_risk_reward: 2.0            # Minimum 1:2 RR
   max_consecutive_losses: 3       # Stop after 3 consecutive losses
   max_drawdown_pct: 10.0          # Kill switch threshold
   min_liquidity_avg_volume: 100000
+  max_aggregate_open_risk_pct: 3.0  # Sum of capital_at_risk across opens
+  max_trades_per_day: 5
+  include_unrealized_in_loss_limits: true
 
 markets:
   exchanges:
@@ -41,7 +44,7 @@ markets:
 
 position_sizing:
   method: atr  # atr | fixed_pct | volatility
-  atr_multiplier: 1.5
+  atr_multiplier: 2.0
   default_atr_period: 14
 
 indicators:
@@ -58,6 +61,9 @@ entry:
   require_trend: true
   require_momentum: true
   require_volume: true
+  require_adx: true
+  min_adx: 20.0
+  min_volume_ratio: 1.0
   min_confidence: 60
   min_fundamental_score: 50
   avoid_major_news: true
@@ -66,6 +72,7 @@ exit:
   use_atr_stop: true
   use_trailing_stop: true
   trailing_atr_mult: 2.0
+  trail_after_r: 1.0
   time_exit_bars: 20
 
 broker:
@@ -78,9 +85,11 @@ paper:
   auto_execute: true
   default_interval_sec: 60
   enable_fno: true
-  max_fo_positions: 3
-  # Cap how many products (SWING/FUT/OPT) can stack on one underlying
+  max_fo_positions: 2
   max_positions_per_symbol: 1
+  max_new_entries_per_cycle: 1
+  symbol_cooldown_hours: 24
+  # Cap how many products (SWING/FUT/OPT) can stack on one underlying
   fo_universe:
     - NIFTY
     - BANKNIFTY

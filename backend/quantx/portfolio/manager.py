@@ -45,8 +45,12 @@ class PortfolioManager:
         kill = self.db.get_state("kill_switch", False)
         dd_lock = self.db.get_state("max_drawdown_lock", False)
         override = self.db.get_state("manual_override", False)
+        trades_today = int(self.db.get_state("trades_today", 0) or 0)
+        risk_day = self.db.get_state("risk_day", None)
+        risk_week = self.db.get_state("risk_week", None)
         opens = self.db.list_positions("OPEN")
         open_risk = sum(p.capital_at_risk for p in opens)
+        unrealized = sum(float(p.pnl or 0) for p in opens)
         self.risk.update_state(
             capital=capital,
             peak_capital=peak,
@@ -58,7 +62,13 @@ class PortfolioManager:
             manual_override=override,
             open_positions=len(opens),
             open_risk_amount=open_risk,
+            unrealized_pnl=unrealized,
+            trades_today=trades_today,
+            risk_day=risk_day,
+            risk_week=risk_week,
         )
+        # Persist rolled day/week counters if calendar advanced
+        self._persist_risk()
 
     def _persist_risk(self) -> None:
         s = self.risk.state
@@ -70,6 +80,9 @@ class PortfolioManager:
         self.db.set_state("kill_switch", s.kill_switch)
         self.db.set_state("max_drawdown_lock", s.max_drawdown_lock)
         self.db.set_state("manual_override", s.manual_override)
+        self.db.set_state("trades_today", s.trades_today)
+        self.db.set_state("risk_day", s.risk_day)
+        self.db.set_state("risk_week", s.risk_week)
 
     def margin_book(self) -> dict:
         """Stocks / F&O / ETF margin breakdown for dashboard."""
@@ -150,9 +163,33 @@ class PortfolioManager:
             reason=rec.reason,
         )
         pos.id = self.db.insert_position(pos)
+        self.risk.register_entry()
         self.risk.update_state(open_positions=len(self.db.list_positions("OPEN")))
         self._persist_risk()
         return pos
+
+    def symbol_on_cooldown(self, symbol: str) -> bool:
+        """True if symbol was recently stopped out (anti-revenge / overtrading)."""
+        raw = self.db.get_state("symbol_cooldowns", {}) or {}
+        if not isinstance(raw, dict):
+            return False
+        until = raw.get(symbol.upper())
+        if not until:
+            return False
+        try:
+            expiry = datetime.fromisoformat(str(until).replace("Z", ""))
+        except Exception:
+            return False
+        return datetime.utcnow() < expiry
+
+    def _set_symbol_cooldown(self, symbol: str, hours: float = 24.0) -> None:
+        from datetime import timedelta
+
+        raw = self.db.get_state("symbol_cooldowns", {}) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        raw[symbol.upper()] = (datetime.utcnow() + timedelta(hours=hours)).isoformat() + "Z"
+        self.db.set_state("symbol_cooldowns", raw)
 
     def mark_to_market(self) -> list[Position]:
         opens = self.db.list_positions("OPEN")
@@ -186,18 +223,27 @@ class PortfolioManager:
             notional = p.entry_price * p.quantity * mult
             p.pnl_pct = (p.pnl / notional * 100) if notional else 0
 
-            # Trailing stop: ratchet in favor of trade
+            # Trailing stop: only after favorable move of trail_after_r (default 1R).
+            # Prior bug: immediately tightened stop to ~0.5R and caused noise stop-outs.
             if self.settings.exit.use_trailing_stop:
-                trail_dist = abs(p.entry_price - p.stop_loss) * 0.5
+                initial_risk = abs(p.entry_price - p.stop_loss)
+                trail_after = float(getattr(self.settings.exit, "trail_after_r", 1.0) or 1.0)
+                trail_mult = float(getattr(self.settings.exit, "trailing_atr_mult", 2.0) or 2.0)
+                # Keep trail distance near initial risk (wider = less noise)
+                trail_dist = initial_risk * max(0.75, trail_mult / 2.0)
                 if p.side == Side.BUY:
-                    candidate = price - trail_dist
-                    if p.trailing_stop is None or candidate > p.trailing_stop:
-                        p.trailing_stop = candidate
+                    favor_r = ((price - p.entry_price) / initial_risk) if initial_risk > 0 else 0.0
+                    if favor_r >= trail_after:
+                        candidate = price - trail_dist
+                        if candidate > p.stop_loss and (p.trailing_stop is None or candidate > p.trailing_stop):
+                            p.trailing_stop = candidate
                     effective_stop = max(p.stop_loss, p.trailing_stop or p.stop_loss)
                 else:
-                    candidate = price + trail_dist
-                    if p.trailing_stop is None or candidate < p.trailing_stop:
-                        p.trailing_stop = candidate
+                    favor_r = ((p.entry_price - price) / initial_risk) if initial_risk > 0 else 0.0
+                    if favor_r >= trail_after:
+                        candidate = price + trail_dist
+                        if candidate < p.stop_loss and (p.trailing_stop is None or candidate < p.trailing_stop):
+                            p.trailing_stop = candidate
                     effective_stop = min(p.stop_loss, p.trailing_stop or p.stop_loss)
             else:
                 effective_stop = p.stop_loss
@@ -286,6 +332,14 @@ class PortfolioManager:
         self._persist_risk()
         fees = self.db.get_state("total_fees", 0.0) + exit_fee
         self.db.set_state("total_fees", fees)
+
+        # Cooldown after stop-outs to prevent immediate re-entry / overtrading
+        if p.pnl < 0 and reason and "stop" in reason.lower():
+            paper_cfg = getattr(self.settings, "paper", None) or {}
+            hours = 24.0
+            if isinstance(paper_cfg, dict):
+                hours = float(paper_cfg.get("symbol_cooldown_hours", 24) or 24)
+            self._set_symbol_cooldown(p.symbol, hours=hours)
 
         entry = TradeJournalEntry(
             symbol=p.symbol,

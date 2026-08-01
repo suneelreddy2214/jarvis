@@ -38,6 +38,16 @@ from quantx.portfolio.margin import MARGIN_FRAC, lot_multiplier
 
 logger = logging.getLogger(__name__)
 
+# Mean-reversion / range strategies intentionally trade low ADX — exempt from ADX strength gate.
+_ADX_EXEMPT_STRATEGIES = {
+    "intraday_mean_reversion",
+    "bollinger_reversion",
+    "value_mean_reversion",
+    "quant_zscore",
+    "options_income_bias",
+    "basis_arbitrage",
+}
+
 
 class QuantXEngine:
     """Institutional decision engine. Capital preservation first."""
@@ -142,6 +152,13 @@ class QuantXEngine:
         # Entry gates
         entry_cfg = self.settings.entry
         rejects: list[str] = []
+        atr_mult = float(self.settings.position_sizing.atr_multiplier or 2.0)
+        risk_scale = float(getattr(macro, "size_multiplier", 1.0) or 1.0)
+        # After a loss streak, cut size before the hard consecutive-loss halt
+        if self.risk.state.consecutive_losses >= 1:
+            risk_scale = min(risk_scale, 0.5)
+        if self.risk.state.consecutive_losses >= 2:
+            risk_scale = min(risk_scale, 0.25)
 
         # When a named strategy already produced a side, do not re-apply trend/momentum
         # gates (they often double-reject valid strategy signals).
@@ -152,8 +169,17 @@ class QuantXEngine:
                 rejects.append("Momentum not confirmed")
         elif strat.name == "intraday_mean_reversion":
             pass  # mean-reversion intentionally trades ranges / neutral momentum
-        if entry_cfg.require_volume and snap.volume_ratio < 0.85 and not index_sym:
-            rejects.append("Volume not confirmed")
+
+        # ADX strength confirmation (post-mortem: many losers lacked trend strength)
+        min_adx = float(getattr(entry_cfg, "min_adx", 20.0) or 20.0)
+        require_adx = bool(getattr(entry_cfg, "require_adx", True))
+        strat_name = strat.name if strat else ""
+        if require_adx and strat_name not in _ADX_EXEMPT_STRATEGIES and snap.adx < min_adx:
+            rejects.append(f"ADX {snap.adx:.1f} < {min_adx:.0f} — trend strength not confirmed")
+
+        min_vol = float(getattr(entry_cfg, "min_volume_ratio", 1.0) or 1.0)
+        if entry_cfg.require_volume and snap.volume_ratio < min_vol and not index_sym:
+            rejects.append(f"Volume not confirmed (ratio {snap.volume_ratio:.2f} < {min_vol:.2f})")
         # Fundamentals: skip / relax for index F&O
         if not index_sym and fund.score < entry_cfg.min_fundamental_score:
             if trade_type not in (TradeType.FUTURES, TradeType.OPTIONS):
@@ -162,6 +188,8 @@ class QuantXEngine:
                 rejects.append(f"Fundamental score {fund.score:.0f} too weak for stock F&O")
         if macro.avoid_new_risk and entry_cfg.avoid_major_news:
             rejects.append(f"Macro risk elevated: {macro.summary}")
+        if risk_scale <= 0:
+            rejects.append(f"Macro size multiplier zero: {macro.summary}")
 
         # --- Product-specific levels & sizing ---
         futures_note = ""
@@ -173,7 +201,7 @@ class QuantXEngine:
             fut_px = round(snap.close * 1.0015, 2)  # mild contango paper proxy
             fut = self.futures.analyze(snap.close, fut_px, days_to_expiry=30)
             futures_note = fut.summary
-            levels = self.ta.levels_for_trade(snap, side)
+            levels = self.ta.levels_for_trade(snap, side, atr_stop_mult=atr_mult)
             # Use futures price as entry reference
             shift = fut_px - snap.close
             levels = {
@@ -185,7 +213,7 @@ class QuantXEngine:
             }
             mult = lot_multiplier(TradeType.FUTURES, symbol_clean)
             # Ensure ≥1 lot can fit inside 1% risk (index ATR stops are often too wide)
-            risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0)
+            risk_budget = capital * (self.settings.risk.max_risk_per_trade_pct / 100.0) * max(risk_scale, 0.01)
             max_stop = risk_budget / mult if mult else levels["entry"]
             stop_dist = abs(levels["entry"] - levels["stop_loss"])
             if stop_dist > max_stop > 0:
@@ -207,6 +235,7 @@ class QuantXEngine:
                 lot_size=mult,
                 broker_margin_pct=MARGIN_FRAC["FUTURES"] * 100,
                 quantity_as_lots=True,
+                risk_scale=risk_scale,
             )
             # Tag nearest monthly (or weekly for index) expiry on futures
             exps = list_expiries(symbol_clean, count=6)
@@ -259,6 +288,7 @@ class QuantXEngine:
                 lot_size=mult,
                 broker_margin_pct=MARGIN_FRAC["OPTIONS_BUY"] * 100,
                 quantity_as_lots=True,
+                risk_scale=risk_scale,
             )
             strategy_tags = strategy_tags + ["options", kind, f"lot={mult}"]
             if expiry_iso:
@@ -266,13 +296,14 @@ class QuantXEngine:
             reason_prefix = f"OPTIONS long {kind}. {fo_meta} "
 
         else:
-            levels = self.ta.levels_for_trade(snap, side)
+            levels = self.ta.levels_for_trade(snap, side, atr_stop_mult=atr_mult)
             size = self.sizer.calculate(
                 capital=capital,
                 entry=levels["entry"],
                 stop_loss=levels["stop_loss"],
                 side=side,
                 atr=snap.atr,
+                risk_scale=risk_scale,
             )
             reason_prefix = ""
 
@@ -390,6 +421,10 @@ class QuantXEngine:
         conf += min(8, (rr - 2) * 4)
         if macro.avoid_new_risk:
             conf -= 15
+        if getattr(macro, "size_multiplier", 1.0) < 1.0:
+            conf -= 8
+        if snap.adx < 20:
+            conf -= 10
         conf = max(0, min(100, conf))
 
         vol_score = min(100, (snap.atr / snap.close * 100) * 25) if snap.close else 50
