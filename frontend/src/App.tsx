@@ -97,6 +97,7 @@ export default function App() {
   const [selectedExpiry, setSelectedExpiry] = useState('')
   const [optionChain, setOptionChain] = useState<Awaited<ReturnType<typeof api.fnoChain>> | null>(null)
   const [searchBusy, setSearchBusy] = useState(false)
+  const [searchError, setSearchError] = useState('')
   const [orders, setOrders] = useState<
     Array<{
       id: number
@@ -441,60 +442,77 @@ export default function App() {
     }
   }
 
-  const runSymbolSearch = async (q?: string) => {
+  const runSymbolSearch = useCallback(async (q?: string) => {
     const query = (q ?? searchQuery).trim()
     setSearchBusy(true)
+    setSearchError('')
     try {
-      const res = await api.search(query)
-      setSearchResults(res.results)
-      if (!query && res.results[0]) {
-        // keep current
-      }
-      setStatus(`Search: ${res.results.length} symbols`)
+      const res = await api.search(query || 'NIFTY')
+      setSearchResults(res.results || [])
+      setStatus(`Search: ${(res.results || []).length} symbols`)
     } catch (err) {
-      setStatus(`Search failed: ${(err as Error).message}`)
+      const msg = (err as Error).message
+      setSearchError(`Search failed: ${msg}`)
+      setStatus(`Search failed: ${msg}`)
     } finally {
       setSearchBusy(false)
     }
-  }
+  }, [searchQuery])
 
-  const loadFnoSymbol = async (symbol: string, expiry?: string) => {
+  const loadFnoSymbol = useCallback(async (symbol: string, expiry?: string) => {
+    const sym = (symbol || 'NIFTY').toUpperCase()
     setSearchBusy(true)
-    setSearchSymbol(symbol)
+    setSearchError('')
+    setSearchSymbol(sym)
+    setSearchQuery(sym)
     try {
-      const ov = await api.fnoOverview(symbol)
+      const ov = await api.fnoOverview(sym)
       setFnoOverview(ov)
-      const exp = expiry || ov.default_expiry || ov.expiries[0]?.expiry || ''
+      const exp = expiry || ov.default_expiry || ov.expiries?.[0]?.expiry || ''
       setSelectedExpiry(exp)
       if (exp) {
-        const chain = await api.fnoChain(symbol, exp)
+        const chain = await api.fnoChain(sym, exp)
         setOptionChain(chain)
       } else {
         setOptionChain(null)
       }
-      setStatus(`Loaded F&O chain for ${symbol}`)
+      setStatus(`Loaded F&O chain for ${sym} — expiries + CE/PE`)
     } catch (err) {
       setFnoOverview(null)
       setOptionChain(null)
-      setStatus(`F&O load failed: ${(err as Error).message}`)
+      const msg = (err as Error).message
+      setSearchError(`F&O load failed: ${msg}. Is the API running on :8000?`)
+      setStatus(`F&O load failed: ${msg}`)
     } finally {
       setSearchBusy(false)
     }
-  }
+  }, [])
 
-  const changeExpiry = async (expiry: string) => {
+  const changeExpiry = useCallback(async (expiry: string) => {
     setSelectedExpiry(expiry)
     if (!searchSymbol || !expiry) return
     setSearchBusy(true)
+    setSearchError('')
     try {
       const chain = await api.fnoChain(searchSymbol, expiry)
       setOptionChain(chain)
+      setStatus(`Option chain ${searchSymbol} · ${expiry}`)
     } catch (err) {
-      setStatus(`Expiry chain failed: ${(err as Error).message}`)
+      const msg = (err as Error).message
+      setSearchError(`Expiry chain failed: ${msg}`)
+      setStatus(`Expiry chain failed: ${msg}`)
     } finally {
       setSearchBusy(false)
     }
-  }
+  }, [searchSymbol])
+
+  useEffect(() => {
+    if (tab !== 'search') return
+    void runSymbolSearch(searchSymbol || 'NIFTY')
+    void loadFnoSymbol(searchSymbol || 'NIFTY', selectedExpiry || undefined)
+    // intentionally only when opening the Search tab
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab])
 
   const setCapitalAbsolute = async () => {
     const n = Number(capitalDelta)
@@ -695,11 +713,7 @@ export default function App() {
         <button className={`tab${tab === 'overview' ? ' active' : ''}`} onClick={() => setTab('overview')} type="button">
           Overview
         </button>
-        <button className={`tab${tab === 'search' ? ' active' : ''}`} onClick={() => {
-          setTab('search')
-          if (!searchResults.length) void runSymbolSearch(searchQuery)
-          if (!optionChain) void loadFnoSymbol(searchSymbol)
-        }} type="button">
+        <button className={`tab${tab === 'search' ? ' active' : ''}`} onClick={() => setTab('search')} type="button">
           Search / F&amp;O
         </button>
         <button className={`tab${tab === 'margin' ? ' active' : ''}`} onClick={() => setTab('margin')} type="button">
@@ -721,24 +735,39 @@ export default function App() {
       </nav>
 
       {tab === 'search' && (
-        <div className="margin-page">
+        <div className="margin-page search-fno-page">
           <section className="panel" style={{ marginBottom: '1rem' }}>
             <div className="panel-head">
               <h2>Search Stocks &amp; F&amp;O</h2>
               <div className="actions">
-                <button className="btn" type="button" disabled={searchBusy} onClick={() => void runSymbolSearch()}>
-                  Search
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={searchBusy}
+                  onClick={() => {
+                    void runSymbolSearch()
+                    void loadFnoSymbol(searchQuery || searchSymbol || 'NIFTY')
+                  }}
+                >
+                  {searchBusy ? 'Loading…' : 'Search'}
                 </button>
               </div>
             </div>
+            <p className="empty" style={{ marginBottom: '0.75rem' }}>
+              Type a symbol or tap a chip to see spot, futures, expiry dates, and Call (CE) / Put (PE) chain.
+            </p>
             <div className="scan-row">
               <input
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => setSearchQuery(e.target.value.toUpperCase())}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') void runSymbolSearch()
+                  if (e.key === 'Enter') {
+                    void runSymbolSearch()
+                    void loadFnoSymbol(searchQuery || 'NIFTY')
+                  }
                 }}
                 placeholder="Search symbol e.g. NIFTY, BANKNIFTY, RELIANCE, TCS"
+                aria-label="Search symbol"
               />
             </div>
             <div className="chips" style={{ marginBottom: '0.75rem' }}>
@@ -747,7 +776,12 @@ export default function App() {
                   key={s}
                   type="button"
                   className="chip"
-                  style={{ cursor: 'pointer', border: 'none', background: searchSymbol === s ? 'var(--teal-dim)' : undefined }}
+                  style={{
+                    cursor: 'pointer',
+                    border: 'none',
+                    background: searchSymbol === s ? 'var(--teal-dim)' : undefined,
+                    color: searchSymbol === s ? 'var(--teal)' : undefined,
+                  }}
                   onClick={() => {
                     setSearchQuery(s)
                     void runSymbolSearch(s)
@@ -758,6 +792,15 @@ export default function App() {
                 </button>
               ))}
             </div>
+            {searchError && (
+              <div className="emergency-banner" style={{ marginBottom: '0.75rem' }}>
+                {searchError}{' '}
+                <button className="btn" type="button" onClick={() => void loadFnoSymbol(searchSymbol || 'NIFTY')}>
+                  Retry
+                </button>
+              </div>
+            )}
+            {searchBusy && !fnoOverview && <p className="empty">Loading F&amp;O details for {searchSymbol || 'NIFTY'}…</p>}
             {searchResults.length > 0 && (
               <table className="table">
                 <thead>
@@ -781,7 +824,14 @@ export default function App() {
                         {r.change_pct != null ? pct(r.change_pct) : '—'}
                       </td>
                       <td>
-                        <button className="btn" type="button" onClick={(e) => { e.stopPropagation(); void loadFnoSymbol(r.symbol) }}>
+                        <button
+                          className="btn"
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void loadFnoSymbol(r.symbol)
+                          }}
+                        >
                           F&amp;O Chain
                         </button>
                       </td>
@@ -790,9 +840,12 @@ export default function App() {
                 </tbody>
               </table>
             )}
+            {!searchBusy && !searchError && searchResults.length === 0 && (
+              <p className="empty">No symbols matched. Try NIFTY or RELIANCE.</p>
+            )}
           </section>
 
-          {fnoOverview && (
+          {fnoOverview ? (
             <section className="panel" style={{ marginBottom: '1rem' }}>
               <div className="panel-head">
                 <h2>
@@ -805,17 +858,17 @@ export default function App() {
               <div className="rec-grid">
                 <div className="rec-cell">
                   <span>Futures LTP</span>
-                  <strong>{inrDec(fnoOverview.futures.ltp)}</strong>
+                  <strong>{inrDec(fnoOverview.futures?.ltp ?? 0)}</strong>
                 </div>
                 <div className="rec-cell">
                   <span>Basis</span>
                   <strong>
-                    {inrDec(fnoOverview.futures.basis)} ({fnoOverview.futures.basis_pct}%)
+                    {inrDec(fnoOverview.futures?.basis ?? 0)} ({fnoOverview.futures?.basis_pct ?? 0}%)
                   </strong>
                 </div>
                 <div className="rec-cell">
                   <span>Fut lot</span>
-                  <strong>{fnoOverview.futures.lot_size}</strong>
+                  <strong>{fnoOverview.futures?.lot_size ?? '—'}</strong>
                 </div>
                 <div className="rec-cell">
                   <span>ATR</span>
@@ -827,7 +880,7 @@ export default function App() {
                 <h2 style={{ fontSize: '1rem' }}>Expiry Dates</h2>
               </div>
               <div className="chips" style={{ marginBottom: '0.75rem' }}>
-                {fnoOverview.expiries.map((ex) => (
+                {(fnoOverview.expiries || []).map((ex) => (
                   <button
                     key={ex.expiry}
                     type="button"
@@ -844,8 +897,11 @@ export default function App() {
                   </button>
                 ))}
               </div>
+              {(fnoOverview.expiries || []).length === 0 && (
+                <p className="empty">No expiry dates returned for this symbol.</p>
+              )}
 
-              {optionChain && (
+              {optionChain ? (
                 <>
                   <div className="rec-grid" style={{ marginBottom: '0.75rem' }}>
                     <div className="rec-cell">
@@ -901,35 +957,54 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {optionChain.rows.map((row) => (
+                        {(optionChain.rows || []).map((row) => (
                           <tr
                             key={row.strike}
                             style={{
                               background: row.is_atm ? 'rgba(62, 207, 172, 0.08)' : undefined,
                             }}
                           >
-                            <td>{row.call.oi.toLocaleString('en-IN')}</td>
-                            <td>{row.call.volume.toLocaleString('en-IN')}</td>
-                            <td>{row.call.iv.toFixed(1)}</td>
-                            <td className="pos">{inrDec(row.call.ltp)}</td>
+                            <td>{(row.call?.oi ?? 0).toLocaleString('en-IN')}</td>
+                            <td>{(row.call?.volume ?? 0).toLocaleString('en-IN')}</td>
+                            <td>{(row.call?.iv ?? 0).toFixed(1)}</td>
+                            <td className="pos">{inrDec(row.call?.ltp ?? 0)}</td>
                             <td>
                               <strong>
                                 {row.strike}
                                 {row.is_atm ? ' · ATM' : ''}
                               </strong>
                             </td>
-                            <td className="neg">{inrDec(row.put.ltp)}</td>
-                            <td>{row.put.iv.toFixed(1)}</td>
-                            <td>{row.put.volume.toLocaleString('en-IN')}</td>
-                            <td>{row.put.oi.toLocaleString('en-IN')}</td>
+                            <td className="neg">{inrDec(row.put?.ltp ?? 0)}</td>
+                            <td>{(row.put?.iv ?? 0).toFixed(1)}</td>
+                            <td>{(row.put?.volume ?? 0).toLocaleString('en-IN')}</td>
+                            <td>{(row.put?.oi ?? 0).toLocaleString('en-IN')}</td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
+                  {(optionChain.rows || []).length === 0 && (
+                    <p className="empty">No CE/PE rows for this expiry.</p>
+                  )}
                 </>
+              ) : (
+                <p className="empty">
+                  {searchBusy ? 'Loading Call / Put option chain…' : 'Select an expiry above to load CE / PE.'}
+                </p>
               )}
             </section>
+          ) : (
+            !searchBusy &&
+            !searchError && (
+              <section className="panel">
+                <p className="empty">
+                  No F&amp;O details yet. Click <strong>NIFTY</strong> or press Search to load expiry dates and the option chain.
+                </p>
+                <button className="btn primary" type="button" onClick={() => void loadFnoSymbol('NIFTY')}>
+                  Load NIFTY F&amp;O Chain
+                </button>
+              </section>
+            )
           )}
         </div>
       )}

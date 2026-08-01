@@ -591,6 +591,14 @@ button {
   animation: fadeUp 0.4s ease both;
 }
 
+.search-fno-page {
+  min-height: 480px;
+}
+
+.search-fno-page .panel {
+  opacity: 1;
+}
+
 .chat-shell {
   display: grid;
   grid-template-rows: 1fr auto;

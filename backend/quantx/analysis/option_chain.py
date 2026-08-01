@@ -250,7 +250,10 @@ class FnoSearchService:
         if not q:
             symbols = SEARCH_UNIVERSE[:limit]
         else:
-            symbols = [s for s in SEARCH_UNIVERSE if q in s][:limit]
+            exact = [s for s in SEARCH_UNIVERSE if s == q]
+            starts = [s for s in SEARCH_UNIVERSE if s.startswith(q) and s != q]
+            contains = [s for s in SEARCH_UNIVERSE if q in s and s not in exact and s not in starts]
+            symbols = (exact + starts + contains)[:limit]
         out = []
         for sym in symbols:
             try:
