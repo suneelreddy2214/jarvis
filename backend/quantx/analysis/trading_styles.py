@@ -8,10 +8,9 @@ Does NOT replace core strategies — registers additively.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-import numpy as np
 import pandas as pd
 
 from quantx.analysis.backtest import Backtester
