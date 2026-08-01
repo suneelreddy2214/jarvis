@@ -20,6 +20,7 @@ from quantx.analysis.fno import DEFAULT_FO_UNIVERSE, is_index
 from quantx.analysis.learning import StrategyLearner
 from quantx.analysis.regime import RegimeDetector
 from quantx.analysis.selector import select_strategies_for_regime
+from quantx.analysis.trading_styles import resolve_style_ids, style_strategy_jobs
 from quantx.core.config import Settings, get_settings
 from quantx.core.engine import QuantXEngine
 from quantx.core.models import TradeRecommendation, TradeType
@@ -57,6 +58,7 @@ class SessionStats:
     trade_types: list[str] = field(default_factory=lambda: ["SWING"])
     enable_fno: bool = False
     use_regime_selector: bool = True
+    style_ids: list[str] = field(default_factory=list)
     last_regime: Optional[str] = None
     last_strategies: list[str] = field(default_factory=list)
 
@@ -112,6 +114,7 @@ class PaperTradingAgent:
                 "trade_types": self.stats.trade_types,
                 "enable_fno": self.stats.enable_fno,
                 "use_regime_selector": self.stats.use_regime_selector,
+                "style_ids": self.stats.style_ids,
                 "last_regime": self.stats.last_regime,
                 "last_strategies": self.stats.last_strategies,
                 "started_at": self.stats.started_at,
@@ -140,26 +143,50 @@ class PaperTradingAgent:
         enable_fno: bool = False,
         trade_types: Optional[list[TradeType | str]] = None,
         fo_symbols: Optional[list[str]] = None,
+        style_ids: Optional[list[str]] = None,
     ) -> dict:
         with self._lock:
             if self.stats.running:
                 return {"ok": False, "message": "Paper session already running", **self.status()}
+
+            resolved_styles = resolve_style_ids(style_ids) if style_ids is not None else []
+            style_id_list = [s.id for s in resolved_styles]
 
             types: list[str]
             if trade_types:
                 types = [
                     t.value if isinstance(t, TradeType) else str(t).upper() for t in trade_types
                 ]
+            elif style_id_list:
+                # Derive products from selected trading styles (Scalping→ETF, etc.)
+                wanted: set[str] = set()
+                for st in resolved_styles:
+                    wanted.update(x.upper() for x in st.trade_types)
+                if not enable_fno:
+                    wanted -= {TradeType.FUTURES.value, TradeType.OPTIONS.value}
+                types = [t for t in ["SWING", "INTRADAY", "FUTURES", "OPTIONS"] if t in wanted]
+                if not types:
+                    types = [
+                        trade_type.value if isinstance(trade_type, TradeType) else str(trade_type)
+                    ]
             elif enable_fno:
                 base = trade_type.value if isinstance(trade_type, TradeType) else str(trade_type)
                 types = []
-                for t in [base, TradeType.FUTURES.value, TradeType.OPTIONS.value]:
+                for t in [base, TradeType.INTRADAY.value, TradeType.FUTURES.value, TradeType.OPTIONS.value]:
                     if t not in types:
                         types.append(t)
             else:
                 types = [
                     trade_type.value if isinstance(trade_type, TradeType) else str(trade_type)
                 ]
+
+            # When styles are active, also ensure INTRADAY is present if any style needs it
+            if style_id_list and TradeType.INTRADAY.value not in types:
+                if any(TradeType.INTRADAY.value in st.trade_types for st in resolved_styles):
+                    if TradeType.SWING.value in types:
+                        types.insert(types.index(TradeType.SWING.value) + 1, TradeType.INTRADAY.value)
+                    else:
+                        types.insert(0, TradeType.INTRADAY.value)
 
             self.stats = SessionStats(
                 started_at=datetime.utcnow().isoformat() + "Z",
@@ -173,13 +200,18 @@ class PaperTradingAgent:
                 enable_fno=enable_fno or any(
                     t in (TradeType.FUTURES.value, TradeType.OPTIONS.value) for t in types
                 ),
+                use_regime_selector=not bool(style_id_list),
+                style_ids=style_id_list,
             )
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, name="quantx-paper-session", daemon=True)
             self._thread.start()
             self.portfolio.db.set_state("paper_session_running", True)
             self.portfolio.db.set_state("paper_enable_fno", self.stats.enable_fno)
-            return {"ok": True, "message": "Paper trading session started", **self.status()}
+            msg = "Paper trading session started"
+            if style_id_list:
+                msg = f"Paper session started with {len(style_id_list)} trading style(s)"
+            return {"ok": True, "message": msg, **self.status()}
 
     def stop(self) -> dict:
         with self._lock:
@@ -239,10 +271,11 @@ class PaperTradingAgent:
 
     def _loop(self) -> None:
         logger.info(
-            "Paper session started | symbols=%s fo=%s types=%s interval=%ss auto=%s",
+            "Paper session started | symbols=%s fo=%s types=%s styles=%s interval=%ss auto=%s",
             self.stats.symbols,
             self.stats.fo_symbols if self.stats.enable_fno else [],
             self.stats.trade_types,
+            self.stats.style_ids[:8] if self.stats.style_ids else [],
             self.stats.interval_sec,
             self.stats.auto_execute,
         )
@@ -291,6 +324,21 @@ class PaperTradingAgent:
         )
 
     def _strategies_for(self, trade_type: str, regime) -> list[str]:
+        # Trading-style mode: Scalping → ETF Investing strategies
+        if self.stats.style_ids:
+            jobs = style_strategy_jobs(
+                self.stats.style_ids,
+                trade_type_filter=[trade_type],
+                limit_per_style=3,
+            )
+            names = [j["strategy"] for j in jobs if j["trade_type"] == trade_type]
+            if names:
+                # Dedupe preserve order
+                out: list[str] = []
+                for n in names:
+                    if n not in out:
+                        out.append(n)
+                return out[:5]
         if not self.stats.use_regime_selector:
             s = self._strategy_for(trade_type)
             return [s] if s else ["swing_trend"]

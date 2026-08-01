@@ -350,7 +350,13 @@ export const api = {
     symbols: string[],
     interval_sec = 60,
     auto_execute = true,
-    opts: { enable_fno?: boolean; trade_type?: string; trade_types?: string[] } = {},
+    opts: {
+      enable_fno?: boolean
+      trade_type?: string
+      trade_types?: string[]
+      style_ids?: string[]
+      fo_symbols?: string[]
+    } = {},
   ) =>
     req<Record<string, unknown>>('/api/paper/start', {
       method: 'POST',
@@ -361,6 +367,8 @@ export const api = {
         trade_type: opts.trade_type || 'SWING',
         enable_fno: opts.enable_fno ?? true,
         trade_types: opts.trade_types,
+        style_ids: opts.style_ids,
+        fo_symbols: opts.fo_symbols,
       }),
     }),
   paperStop: () => req<Record<string, unknown>>('/api/paper/stop', { method: 'POST' }),

@@ -84,6 +84,7 @@ export default function App() {
   const [strategy, setStrategy] = useState('swing_trend')
   const [enableFno, setEnableFno] = useState(true)
   const [scanProduct, setScanProduct] = useState<'ALL' | 'SWING' | 'FUTURES' | 'OPTIONS'>('ALL')
+  const [scanStyle, setScanStyle] = useState<string>('all')
   const [huntMarket, setHuntMarket] = useState(true)
   const [hunted, setHunted] = useState<
     Array<{
@@ -279,19 +280,38 @@ export default function App() {
     return () => clearInterval(id)
   }, [refresh, paperRunning])
 
+  const styleIdsForRequest = (): string[] | undefined => {
+    if (!scanStyle || scanStyle === 'auto') return undefined
+    if (scanStyle === 'all') return ['all']
+    return [scanStyle]
+  }
+
   const startPaper = async () => {
     setBusy(true)
     try {
       const list = symbols.split(',').map((s) => s.trim()).filter(Boolean)
+      const styleIds = styleIdsForRequest()
+      const tradeTypes = enableFno
+        ? ['SWING', 'INTRADAY', 'FUTURES', 'OPTIONS']
+        : scanStyle !== 'auto'
+          ? ['SWING', 'INTRADAY']
+          : ['SWING']
       await api.paperStart(list, 60, true, {
         enable_fno: enableFno,
         trade_type: 'SWING',
-        trade_types: enableFno ? ['SWING', 'FUTURES', 'OPTIONS'] : ['SWING'],
+        trade_types: tradeTypes,
+        style_ids: styleIds,
       })
+      const styleLabel =
+        scanStyle === 'auto'
+          ? 'regime selector'
+          : scanStyle === 'all'
+            ? 'all trading styles'
+            : `style: ${styleGroups.find((g) => g.id === scanStyle)?.name || scanStyle}`
       setStatus(
         enableFno
-          ? 'Paper session STARTED — Stocks + F&O (Futures/Options) under risk gates'
-          : 'Paper session STARTED — equity only under risk gates',
+          ? `Paper session STARTED — Stocks + F&O · ${styleLabel}`
+          : `Paper session STARTED — equity · ${styleLabel}`,
       )
       await refresh()
     } catch (err) {
@@ -568,14 +588,21 @@ export default function App() {
     // Product dropdown is the source of truth for Scan (checkbox is kept in sync).
     const useFno = scanProduct === 'ALL'
     const product = scanProduct === 'ALL' ? 'SWING' : scanProduct
+    const styleIds = styleIdsForRequest()
+    const styleLabel =
+      scanStyle === 'auto'
+        ? ''
+        : scanStyle === 'all'
+          ? ' · all trading styles'
+          : ` · ${styleGroups.find((g) => g.id === scanStyle)?.name || scanStyle}`
     setStatus(
       huntMarket
-        ? `AI hunting market opportunities across universe, then processing via strategies…`
+        ? `AI hunting market opportunities across universe, then processing via strategies${styleLabel}…`
         : useFno
-          ? 'Scanning Stocks + F&O…'
+          ? `Scanning Stocks + F&O${styleLabel}…`
           : scanProduct === 'SWING'
-            ? 'Scanning Stocks only…'
-            : `Scanning ${scanProduct} only…`,
+            ? `Scanning Stocks only${styleLabel}…`
+            : `Scanning ${scanProduct} only${styleLabel}…`,
     )
     try {
       const res = await api.scan(list, {
@@ -583,6 +610,7 @@ export default function App() {
         trade_type: product,
         hunt_market: huntMarket,
         top_n: 8,
+        style_ids: styleIds,
       })
       const rows = res.recommendations || []
       setRecs(rows)
@@ -596,10 +624,18 @@ export default function App() {
           `${res.message || ''} · regime ${res.regime?.regime || '—'} · ${stratCount} strategies` +
             (res.styles_touched?.length
               ? ` · styles ${res.styles_touched
-                  .slice(0, 4)
+                  .slice(0, 6)
                   .map((s) => s.name)
                   .join(', ')}`
               : ''),
+        )
+      } else if (res.mode === 'trading_styles' && res.styles_touched?.length) {
+        setHunted([])
+        setHuntMeta(
+          `${res.message || ''} · styles ${res.styles_touched
+            .slice(0, 8)
+            .map((s) => s.name)
+            .join(', ')}`,
         )
       } else {
         setHunted([])
@@ -608,7 +644,7 @@ export default function App() {
       setStatus(
         rows.length === 0
           ? 'Scan returned no recommendations'
-          : `${res.mode === 'market_hunt' ? 'Hunt' : 'Scan'} complete — ${res.valid_count}/${res.count} actionable · ${
+          : `${res.mode === 'market_hunt' ? 'Hunt' : res.mode === 'trading_styles' ? 'Style scan' : 'Scan'} complete — ${res.valid_count}/${res.count} actionable · ${
               firstValid
                 ? `selected ${firstValid.symbol} ${firstValid.trade_type}${firstValid.valid ? '' : ' (rejected setup)'}`
                 : 'none selected'
@@ -1899,6 +1935,20 @@ export default function App() {
                 <option value="FUTURES">Futures only</option>
                 <option value="OPTIONS">Options only</option>
               </select>
+              <select
+                value={scanStyle}
+                onChange={(e) => setScanStyle(e.target.value)}
+                aria-label="Trading style"
+                title="Trading style (Scalping → ETF investing)"
+              >
+                <option value="auto">Style: Auto (regime)</option>
+                <option value="all">Style: All styles</option>
+                {styleGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
             </div>
             {huntMeta && <p className="prose" style={{ marginTop: '0.5rem' }}>{huntMeta}</p>}
             {hunted.length > 0 && (
@@ -1966,6 +2016,18 @@ export default function App() {
                       <td>{r.symbol}</td>
                       <td>
                         <span className="pill valid">{r.trade_type}</span>
+                        {(() => {
+                          const sid = (r.supporting_indicators || [])
+                            .find((x) => x.startsWith('style:'))
+                            ?.slice(6)
+                          if (!sid) return null
+                          const name = styleGroups.find((g) => g.id === sid)?.name || sid
+                          return (
+                            <div style={{ fontSize: '0.7rem', color: 'var(--muted)', marginTop: 2 }}>
+                              {name}
+                            </div>
+                          )
+                        })()}
                       </td>
                       <td>
                         <span className={`pill ${r.side === 'BUY' ? 'buy' : 'sell'}`}>{r.side}</span>
@@ -2133,6 +2195,27 @@ export default function App() {
               />
               Auto-trade F&amp;O with Stocks
             </label>
+            <div className="scan-row" style={{ marginTop: '0.65rem' }}>
+              <select
+                value={scanStyle}
+                disabled={paperRunning}
+                onChange={(e) => setScanStyle(e.target.value)}
+                aria-label="Paper trading style"
+                title="Paper agent trading style"
+              >
+                <option value="auto">Style: Auto (regime)</option>
+                <option value="all">Style: All styles (Scalping→ETF)</option>
+                {styleGroups.map((g) => (
+                  <option key={`paper-${g.id}`} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <p className="prose" style={{ marginTop: '0.4rem', fontSize: '0.8rem' }}>
+              Agent can run Scalping, Intraday, Momentum, Swing, Position, Trend, Breakout, Mean Reversion,
+              Options/Futures, Arbitrage, Pair, Event/News, Quant/Algo, and long-term investing styles when selected.
+            </p>
 
             <div className="panel-head" style={{ marginTop: '1rem' }}>
               <h2 style={{ fontSize: '1rem' }}>Paper Capital</h2>

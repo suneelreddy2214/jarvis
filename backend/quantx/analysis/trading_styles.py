@@ -739,6 +739,73 @@ def get_style(style_id: str) -> Optional[TradingStyle]:
     return None
 
 
+def resolve_style_ids(style_ids: Optional[list[str]]) -> list[TradingStyle]:
+    """Resolve requested style ids; empty/None → all catalog styles."""
+    if not style_ids:
+        return list(TRADING_STYLES)
+    out: list[TradingStyle] = []
+    seen: set[str] = set()
+    for sid in style_ids:
+        key = (sid or "").strip().lower()
+        if not key or key in seen:
+            continue
+        if key in ("all", "*"):
+            return list(TRADING_STYLES)
+        st = get_style(key)
+        if st:
+            out.append(st)
+            seen.add(key)
+    return out or list(TRADING_STYLES)
+
+
+def style_strategy_jobs(
+    style_ids: Optional[list[str]] = None,
+    *,
+    trade_type_filter: Optional[list[str]] = None,
+    limit_per_style: int = 5,
+) -> list[dict[str, str]]:
+    """
+    Expand trading styles into runnable (style, strategy, trade_type) jobs.
+    Used by Scan / paper agent so Scalping → ETF styles can all run.
+    """
+    styles = resolve_style_ids(style_ids)
+    allowed = {t.upper() for t in trade_type_filter} if trade_type_filter else None
+    jobs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for style in styles:
+        n = 0
+        style_tts = {x.upper() for x in style.trade_types}
+        for strat_name in style.strategies:
+            if strat_name not in STRATEGIES:
+                continue
+            strat = STRATEGIES[strat_name]
+            tt = strat.trade_type.value if hasattr(strat.trade_type, "value") else str(strat.trade_type)
+            tt = str(tt).upper()
+            # Prefer strategy's native product; skip if product filter excludes it
+            if allowed is not None and tt not in allowed:
+                continue
+            # Skip strategies whose product the style does not cover
+            if style_tts and tt not in style_tts:
+                continue
+            key = (tt, strat_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            jobs.append(
+                {
+                    "style_id": style.id,
+                    "style_name": style.name,
+                    "holding_period": style.holding_period,
+                    "strategy": strat_name,
+                    "trade_type": tt,
+                }
+            )
+            n += 1
+            if n >= limit_per_style:
+                break
+    return jobs
+
+
 DEFAULT_TRAIN_SYMBOLS = [
     "RELIANCE",
     "TCS",

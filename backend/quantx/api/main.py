@@ -13,13 +13,18 @@ from pydantic import BaseModel, Field
 
 from quantx import __version__
 from quantx.analysis.backtest import Backtester
-from quantx.analysis.fno import DEFAULT_FO_UNIVERSE
+from quantx.analysis.fno import DEFAULT_FO_UNIVERSE, is_index
 from quantx.analysis.option_chain import FnoSearchService, SEARCH_UNIVERSE
 from quantx.analysis.strategies import list_strategies
 import quantx.analysis.additional_strategies  # noqa: F401 — register additive strategies
 import quantx.analysis.trading_styles  # noqa: F401 — register style strategies
 from quantx.analysis.learning import StrategyLearner
-from quantx.analysis.trading_styles import get_trading_styles, train_trading_styles
+from quantx.analysis.trading_styles import (
+    get_trading_styles,
+    train_trading_styles,
+    style_strategy_jobs,
+    resolve_style_ids,
+)
 from quantx.analysis.opportunity_hunter import OpportunityHunter, HUNT_UNIVERSE
 from quantx.analysis.regime import RegimeDetector
 from quantx.core.chat import QuantXChat
@@ -238,6 +243,7 @@ class PaperStartRequest(BaseModel):
     enable_fno: bool = True
     trade_types: Optional[list[TradeType]] = None
     fo_symbols: Optional[list[str]] = None
+    style_ids: Optional[list[str]] = None
 
 
 class PaperResetRequest(BaseModel):
@@ -456,16 +462,85 @@ def scan(req: ScanRequest):
     if req.hunt_market:
         hunter = OpportunityHunter(engine=engine, market_data=market_data, db=db)
         tt = req.trade_type.value if isinstance(req.trade_type, TradeType) else str(req.trade_type)
+        # Default hunt uses all trading styles when none specified
+        style_ids = req.style_ids if req.style_ids is not None else [s.id for s in resolve_style_ids(None)]
         result = hunter.hunt_and_process(
             seed_symbols=req.symbols,
             top_n=req.top_n,
             exchange=req.exchange,
             enable_fno=req.enable_fno or tt == "ALL",
             trade_type="ALL" if req.enable_fno else tt,
-            style_ids=req.style_ids,
+            style_ids=style_ids,
             min_score=req.min_hunt_score,
         )
         return result
+
+    # Style-driven scan (Scalping → ETF investing, etc.)
+    if req.style_ids is not None:
+        tt = req.trade_type.value if isinstance(req.trade_type, TradeType) else str(req.trade_type)
+        if req.enable_fno or tt == "ALL":
+            product_filter = ["SWING", "INTRADAY", "FUTURES", "OPTIONS"]
+        else:
+            product_filter = [tt]
+        jobs = style_strategy_jobs(req.style_ids, trade_type_filter=product_filter, limit_per_style=4)
+        fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
+        equity_syms = [s for s in req.symbols if not is_index(s)] or list(req.symbols)
+        results = []
+        strategies_used: dict[str, list[str]] = {}
+        styles_touched = []
+        seen_styles: set[str] = set()
+        for job in jobs:
+            trade_type = TradeType(job["trade_type"])
+            syms = fo_syms if trade_type in (TradeType.FUTURES, TradeType.OPTIONS) else equity_syms
+            try:
+                batch = engine.scan_watchlist(syms, req.exchange, trade_type, strategy=job["strategy"])
+                for r in batch:
+                    # Tag trading style on the recommendation for UI
+                    r.supporting_indicators = list(r.supporting_indicators or []) + [
+                        f"style:{job['style_id']}",
+                        f"holding:{job['holding_period']}",
+                    ]
+                    if r.reason and f"[{job['strategy']}]" not in r.reason:
+                        r.reason = f"[{job['style_name']}] {r.reason}"
+                results.extend(batch)
+                strategies_used.setdefault(job["trade_type"], [])
+                if job["strategy"] not in strategies_used[job["trade_type"]]:
+                    strategies_used[job["trade_type"]].append(job["strategy"])
+                if job["style_id"] not in seen_styles:
+                    seen_styles.add(job["style_id"])
+                    styles_touched.append(
+                        {
+                            "id": job["style_id"],
+                            "name": job["style_name"],
+                            "holding_period": job["holding_period"],
+                        }
+                    )
+            except Exception as e:
+                logger.exception("Style scan failed %s/%s: %s", job["style_id"], job["strategy"], e)
+
+        # Dedupe symbol+product keep highest confidence
+        best = {}
+        for r in results:
+            key = (r.symbol, r.trade_type.value)
+            prev = best.get(key)
+            if prev is None or (r.valid and not prev.valid) or (
+                r.valid == prev.valid and r.scores.confidence > prev.scores.confidence
+            ):
+                best[key] = r
+        results = list(best.values())
+        results.sort(key=lambda r: (not r.valid, -r.scores.confidence))
+        return {
+            "count": len(results),
+            "valid_count": sum(1 for r in results if r.valid),
+            "enable_fno": req.enable_fno,
+            "mode": "trading_styles",
+            "hunted_symbols": req.symbols,
+            "strategies_used": strategies_used,
+            "styles_touched": styles_touched,
+            "jobs_run": len(jobs),
+            "recommendations": [r.model_dump(mode="json") for r in results],
+            "message": f"Scanned {len(styles_touched)} trading style(s) / {len(jobs)} strategy jobs",
+        }
 
     results = []
     if req.enable_fno:
@@ -474,7 +549,9 @@ def scan(req: ScanRequest):
         fo_syms = req.fo_symbols or list(DEFAULT_FO_UNIVERSE)
         futs = engine.scan_watchlist(fo_syms, req.exchange, TradeType.FUTURES, strategy="futures_trend")
         opts = engine.scan_watchlist(fo_syms, req.exchange, TradeType.OPTIONS, strategy="options_directional")
-        results = equity + futs + opts
+        # Also include intraday when doing all-products
+        intra = engine.scan_watchlist(req.symbols, req.exchange, TradeType.INTRADAY, strategy="intraday_momentum")
+        results = equity + intra + futs + opts
         results.sort(key=lambda r: (not r.valid, -r.scores.confidence))
     else:
         strat = req.strategy
@@ -483,6 +560,8 @@ def scan(req: ScanRequest):
                 strat = "futures_trend"
             elif req.trade_type == TradeType.OPTIONS:
                 strat = "options_directional"
+            elif req.trade_type == TradeType.INTRADAY:
+                strat = "intraday_momentum"
         results = engine.scan_watchlist(req.symbols, req.exchange, req.trade_type, strategy=strat)
     return {
         "count": len(results),
@@ -698,6 +777,7 @@ def paper_start(req: PaperStartRequest):
         enable_fno=req.enable_fno,
         trade_types=req.trade_types,
         fo_symbols=req.fo_symbols,
+        style_ids=req.style_ids,
     )
 
 

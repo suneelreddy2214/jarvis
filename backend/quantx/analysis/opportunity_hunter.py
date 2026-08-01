@@ -18,7 +18,7 @@ from quantx.analysis.regime import RegimeDetector
 from quantx.analysis.selector import select_strategies_for_regime
 from quantx.analysis.strategies import STRATEGIES
 from quantx.analysis.technical import TechnicalAnalyzer
-from quantx.analysis.trading_styles import TRADING_STYLES, get_style
+from quantx.analysis.trading_styles import TRADING_STYLES, get_style, resolve_style_ids, style_strategy_jobs
 from quantx.core.engine import QuantXEngine
 from quantx.core.models import TradeRecommendation, TradeType
 from quantx.data.market_data import MarketDataService
@@ -252,19 +252,31 @@ class OpportunityHunter:
         picked: dict[str, list[str]] = {}
 
         if style_ids:
-            for sid in style_ids:
-                style = get_style(sid)
-                if not style:
+            jobs = style_strategy_jobs(
+                style_ids,
+                trade_type_filter=trade_types,
+                limit_per_style=limit_per_product,
+            )
+            for job in jobs:
+                tt = job["trade_type"]
+                if tt not in trade_types:
                     continue
-                for tt in style.trade_types:
-                    if tt not in trade_types:
-                        continue
-                    names = [n for n in style.strategies if n in STRATEGIES]
-                    picked.setdefault(tt, [])
-                    for n in names:
-                        if n not in picked[tt]:
-                            picked[tt].append(n)
-                    picked[tt] = picked[tt][:limit_per_product]
+                picked.setdefault(tt, [])
+                if job["strategy"] not in picked[tt]:
+                    picked[tt].append(job["strategy"])
+                picked[tt] = picked[tt][: max(limit_per_product, 2)]
+            # Ensure every requested product has at least a fallback if styles miss it
+            for tt in trade_types:
+                if tt in picked and picked[tt]:
+                    continue
+                if tt == "FUTURES":
+                    picked[tt] = ["futures_trend", "futures_momentum"][:limit_per_product]
+                elif tt == "OPTIONS":
+                    picked[tt] = ["options_directional"][:limit_per_product]
+                elif tt == "INTRADAY":
+                    picked[tt] = ["intraday_momentum", "scalping_micro"][:limit_per_product]
+                else:
+                    picked[tt] = ["swing_trend", "breakout"][:limit_per_product]
             return picked
 
         for tt in trade_types:
@@ -371,7 +383,7 @@ class OpportunityHunter:
             symbols = [s.strip().upper() for s in seed_symbols if s.strip()]
 
         if enable_fno or trade_type == "ALL":
-            types = ["SWING", "FUTURES", "OPTIONS"]
+            types = ["SWING", "INTRADAY", "FUTURES", "OPTIONS"]
         elif trade_type == "SWING":
             types = ["SWING", "INTRADAY"]
         else:
@@ -380,10 +392,8 @@ class OpportunityHunter:
         # If styles requested, expand types to style products
         if style_ids:
             extra: set[str] = set(types)
-            for sid in style_ids:
-                st = get_style(sid)
-                if st:
-                    extra.update(st.trade_types)
+            for st in resolve_style_ids(style_ids):
+                extra.update(st.trade_types)
             types = [t for t in ["SWING", "INTRADAY", "FUTURES", "OPTIONS"] if t in extra] or types
 
         recs, strat_map, regime = self.process_symbols(
@@ -396,13 +406,28 @@ class OpportunityHunter:
 
         styles_used = []
         if style_ids:
-            styles_used = [get_style(s).as_dict() for s in style_ids if get_style(s)]
+            styles_used = [
+                {
+                    "id": st.id,
+                    "name": st.name,
+                    "holding_period": st.holding_period,
+                    "ai_suitability": st.ai_suitability,
+                }
+                for st in resolve_style_ids(style_ids)
+            ]
         else:
             # summarize styles whose strategies were used
             used = {n for names in strat_map.values() for n in names}
             for st in TRADING_STYLES:
                 if any(x in used for x in st.strategies):
-                    styles_used.append({"id": st.id, "name": st.name, "ai_suitability": st.ai_suitability})
+                    styles_used.append(
+                        {
+                            "id": st.id,
+                            "name": st.name,
+                            "holding_period": st.holding_period,
+                            "ai_suitability": st.ai_suitability,
+                        }
+                    )
 
         return {
             "ok": True,
