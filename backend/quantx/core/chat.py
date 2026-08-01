@@ -366,6 +366,8 @@ class QuantXLLMChat:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "User-Agent": "QuantX/1.0 (+https://github.com/suneelreddy2214/jarvis)",
+            "Accept": "application/json",
         }
         if provider == "openrouter":
             headers["HTTP-Referer"] = "https://quantx.local"
@@ -378,7 +380,7 @@ class QuantXLLMChat:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=90) as resp:
                 data = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="ignore")
